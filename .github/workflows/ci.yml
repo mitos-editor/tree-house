@@ -32,6 +32,21 @@ jobs:
       - name: Run cargo check without default features
         run: cargo check --no-default-features
 
+  check-windows:
+    name: Windows bindings
+    runs-on: windows-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compile vendored Tree-sitter
+        run: cargo check -p tree-house-bindings --all-features --locked
+
   test:
     name: Test
     runs-on: ubuntu-latest
