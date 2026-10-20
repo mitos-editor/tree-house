@@ -55,12 +55,8 @@ impl<'a> Input for RopeInput<'a> {
     }
 
     fn eq(&mut self, range1: ops::Range<u32>, range2: ops::Range<u32>) -> bool {
-        let range1 = self
-            .src
-            .slice(range1.start as usize..range1.end as usize);
-        let range2 = self
-            .src
-            .slice(range2.start as usize..range2.end as usize);
+        let range1 = self.src.slice(range1.start as usize..range1.end as usize);
+        let range2 = self.src.slice(range2.start as usize..range2.end as usize);
         range1 == range2
     }
 }

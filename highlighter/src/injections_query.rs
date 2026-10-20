@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hashbrown::{HashMap, HashSet};
-use std::sync::LazyLock;
 use regex_cursor::engines::meta::Regex;
 use ropey::{LineType, RopeSlice};
+use std::sync::LazyLock;
 
 use crate::config::{LanguageConfig, LanguageLoader};
 use crate::highlighter::Highlight;
