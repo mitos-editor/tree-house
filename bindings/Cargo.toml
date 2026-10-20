@@ -18,7 +18,7 @@ tree-sitter-language = ["dep:tree-sitter-language"]
 
 [dependencies]
 ropey = { version = "2.0.0-beta.1", default-features = false, optional=true }
-regex-cursor = { version = "0.1.5", git = "https://github.com/mitos-editor/regex-cursor", rev = "c67264c986709dc45e9ee4efc680813d199c6954" }
+regex-cursor = { version = "0.1.5", git = "https://github.com/mitos-editor/regex-cursor", rev = "4db0a68e0c518af353126f0528f0db52c85bc6a0" }
 libloading = "0.8"
 thiserror = "2.0"
 tree-sitter-language = { version = "0.1.5", optional = true }
