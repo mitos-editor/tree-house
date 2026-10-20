@@ -227,10 +227,7 @@ pub fn highlighter_fixture(
 
         while start >= line_end {
             res.push_str(&ident);
-            res.extend(
-                src.slice(line_start as usize..line_end as usize)
-                    .chunks(),
-            );
+            res.extend(src.slice(line_start as usize..line_end as usize).chunks());
             annotate_line(
                 comment_prefix,
                 src,
@@ -242,7 +239,7 @@ pub fn highlighter_fixture(
             line_highlights.clear();
             line_idx += 1;
             line_start = line_end;
-            line_end = if line_idx + 1 <= src.len_lines(LineType::LF) {
+            line_end = if line_idx < src.len_lines(LineType::LF) {
                 src.line_to_byte_idx(line_idx + 1, LineType::LF) as u32
             } else {
                 src.len() as u32
@@ -256,10 +253,7 @@ pub fn highlighter_fixture(
         }
         while pos > line_end {
             res.push_str(&ident);
-            res.extend(
-                src.slice(line_start as usize..line_end as usize)
-                    .chunks(),
-            );
+            res.extend(src.slice(line_start as usize..line_end as usize).chunks());
             annotate_line(
                 comment_prefix,
                 src,
@@ -271,7 +265,7 @@ pub fn highlighter_fixture(
             line_highlights.clear();
             line_idx += 1;
             line_start = line_end;
-            line_end = if line_idx + 1 <= src.len_lines(LineType::LF) {
+            line_end = if line_idx < src.len_lines(LineType::LF) {
                 src.line_to_byte_idx(line_idx + 1, LineType::LF) as u32
             } else {
                 src.len() as u32
@@ -284,10 +278,7 @@ pub fn highlighter_fixture(
     }
     if !line_highlights.is_empty() {
         res.push_str(&ident);
-        res.extend(
-            src.slice(line_start as usize..line_end as usize)
-                .chunks(),
-        );
+        res.extend(src.slice(line_start as usize..line_end as usize).chunks());
         if !res.ends_with('\n') {
             res.push('\n');
         }
@@ -380,10 +371,7 @@ pub fn injections_fixture(
         if start != pos {
             while pos >= line_end {
                 res.push_str(&ident);
-                res.extend(
-                    src.slice(line_start as usize..line_end as usize)
-                        .chunks(),
-                );
+                res.extend(src.slice(line_start as usize..line_end as usize).chunks());
                 annotate_line(
                     comment_prefix,
                     src,
@@ -395,7 +383,7 @@ pub fn injections_fixture(
                 line_labels.clear();
                 line_idx += 1;
                 line_start = line_end;
-                line_end = if line_idx + 1 <= src.len_lines(LineType::LF) {
+                line_end = if line_idx < src.len_lines(LineType::LF) {
                     src.line_to_byte_idx(line_idx + 1, LineType::LF) as u32
                 } else {
                     src.len() as u32
@@ -421,10 +409,7 @@ pub fn injections_fixture(
     }
     if !line_labels.is_empty() {
         res.push_str(&ident);
-        res.extend(
-            src.slice(line_start as usize..line_end as usize)
-                .chunks(),
-        );
+        res.extend(src.slice(line_start as usize..line_end as usize).chunks());
         if !res.ends_with('\n') {
             res.push('\n');
         }

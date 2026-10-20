@@ -5,9 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use indexmap::{IndexMap, IndexSet};
-use std::sync::LazyLock;
-use std::cell::OnceCell;
 use skidder::Repo;
+use std::cell::OnceCell;
+use std::sync::LazyLock;
 use tree_sitter::{Grammar, InputEdit, Point};
 
 use crate::config::{LanguageConfig, LanguageLoader};
