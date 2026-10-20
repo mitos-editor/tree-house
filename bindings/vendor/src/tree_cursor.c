@@ -3,6 +3,11 @@
 #include "./language.h"
 #include "./tree.h"
 
+_Static_assert(
+  sizeof(TreeCursor) <= sizeof(TSTreeCursor),
+  "TreeCursor must fit within TSTreeCursor"
+);
+
 typedef struct {
   Subtree parent;
   const TSTree *tree;
@@ -153,8 +158,10 @@ static inline bool ts_tree_cursor_child_iterator_previous(
 // TSTreeCursor - lifecycle
 
 TSTreeCursor ts_tree_cursor_new(TSNode node) {
-  TSTreeCursor self = {NULL, NULL, {0, 0, 0}};
-  ts_tree_cursor_init((TreeCursor *)&self, node);
+  TreeCursor cursor = {0};
+  ts_tree_cursor_init(&cursor, node);
+  TSTreeCursor self = {0};
+  memcpy(&self, &cursor, sizeof(cursor));
   return self;
 }
 
@@ -550,8 +557,10 @@ void ts_tree_cursor_current_status(
       (*supertype_count)++;
     }
 
-    // Determine if the current node has later siblings.
-    if (!*has_later_siblings) {
+    // Determine if the current node has later siblings. A later *anonymous*
+    // sibling settles `has_later_siblings` but says nothing about later *named*
+    // siblings.
+    if (!*has_later_named_siblings) {
       unsigned sibling_count = parent_entry->subtree->ptr->child_count;
       unsigned structural_child_index = entry->structural_child_index;
       if (!ts_subtree_extra(*entry->subtree)) structural_child_index++;
@@ -563,14 +572,12 @@ void ts_tree_cursor_current_status(
         );
         if (sibling_metadata.visible) {
           *has_later_siblings = true;
-          if (*has_later_named_siblings) break;
           if (sibling_metadata.named) {
             *has_later_named_siblings = true;
             break;
           }
         } else if (ts_subtree_visible_child_count(sibling) > 0) {
           *has_later_siblings = true;
-          if (*has_later_named_siblings) break;
           if (sibling.ptr->named_child_count > 0) {
             *has_later_named_siblings = true;
             break;
@@ -697,12 +704,13 @@ const char *ts_tree_cursor_current_field_name(const TSTreeCursor *_self) {
 
 TSTreeCursor ts_tree_cursor_copy(const TSTreeCursor *_cursor) {
   const TreeCursor *cursor = (const TreeCursor *)_cursor;
-  TSTreeCursor res = {NULL, NULL, {0, 0}};
-  TreeCursor *copy = (TreeCursor *)&res;
-  copy->tree = cursor->tree;
-  copy->root_alias_symbol = cursor->root_alias_symbol;
-  array_init(&copy->stack);
-  array_push_all(&copy->stack, &cursor->stack);
+  TreeCursor copy = {0};
+  copy.tree = cursor->tree;
+  copy.root_alias_symbol = cursor->root_alias_symbol;
+  array_init(&copy.stack);
+  array_push_all(&copy.stack, &cursor->stack);
+  TSTreeCursor res = {0};
+  memcpy(&res, &copy, sizeof(copy));
   return res;
 }
 
