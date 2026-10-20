@@ -414,4 +414,133 @@ mod tests {
         }
         assert!(count > 0, "expected at least one match");
     }
+
+    #[test]
+    fn unrestricted_queries_preserve_matches_and_capture_order() {
+        // A finite range covering the entire source forces the original path.
+        // Compare both cursor APIs, including matches in descendants whose
+        // ancestors cannot start a pattern and states that span several nodes.
+        let grammar = python_grammar();
+        let queries: Vec<_> = [
+            "",
+            "(integer) @value",
+            "(identifier) @name",
+            "(call function: (identifier) @function arguments: (argument_list (identifier) @argument))",
+            "((expression_statement) @first . (return_statement) @second)",
+            "(_) @node",
+            "(primary_expression/identifier) @name",
+            "[(identifier) (integer)] @value",
+            "((identifier)+ @names)",
+            "((identifier) @name (#eq? @name \"value\"))",
+            "(function_definition !return_type) @function",
+            "(identifier) @first\n(identifier) @second",
+            "[\"(\" \")\"] @punctuation",
+            "(ERROR) @error",
+            "(MISSING identifier) @missing",
+        ]
+        .map(|text| (text, Query::new(grammar, text, |_, _| Ok(())).unwrap()))
+        .into();
+        let original = "def outer(value, other):\n    total = value + 1\n    consume(value, other)\n    return total\n# 界\nπ = 2\n";
+        let mut source = original.to_owned();
+        let mut random = 7u64;
+        let mut parser = Parser::new();
+        parser.set_grammar(grammar).unwrap();
+        for sample in 0..100 {
+            if sample == 90 {
+                source.clear();
+            } else if sample % 10 == 0 {
+                source = original.to_owned();
+            } else {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let boundaries: Vec<_> = source
+                    .char_indices()
+                    .map(|(at, _)| at)
+                    .chain([source.len()])
+                    .collect();
+                let at = boundaries[random as usize % boundaries.len()];
+                if sample % 3 == 0 && at < source.len() {
+                    source.remove(at);
+                } else {
+                    source.insert_str(at, ["#", " ", "\n", "(", ")", "x", "'"][sample % 7]);
+                }
+            }
+            let tree = parser.parse(StrInput::new(&source), None).unwrap();
+            for (text, query) in &queries {
+                for by_capture in [false, true] {
+                    let results: Vec<_> = [u32::MAX, source.len() as u32 + 1]
+                        .map(|end| {
+                            let cursor = InactiveQueryCursor::new(0..end, u32::MAX);
+                            let mut cursor = cursor.execute_query(
+                                query,
+                                &tree.root_node(),
+                                StrInput::new(&source),
+                            );
+                            let mut result = Vec::new();
+                            let mut record = |mat: &super::QueryMatch<'_, '_>, idx| {
+                                let matched = mat.matched_node(idx);
+                                result.push((
+                                    mat.pattern(),
+                                    matched.capture,
+                                    matched.node.kind().to_owned(),
+                                    matched.node.byte_range(),
+                                ));
+                            };
+                            if by_capture {
+                                while let Some((mat, idx)) = cursor.next_matched_node() {
+                                    record(&mat, idx);
+                                }
+                            } else {
+                                while let Some(mat) = cursor.next_match() {
+                                    for idx in 0..mat.matched_nodes().count() as u32 {
+                                        record(&mat, idx);
+                                    }
+                                }
+                            }
+                            result
+                        })
+                        .into();
+                    assert_eq!(
+                        results[0], results[1],
+                        "query: {text}, source: {source:?}, by_capture: {by_capture}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode query comparison"]
+    fn query_cursor_performance() {
+        use std::time::Instant;
+        let grammar = python_grammar();
+        let source = "def item(value):\n    return value + 1\n".repeat(100_000);
+        let mut parser = Parser::new();
+        parser.set_grammar(grammar).unwrap();
+        let tree = parser.parse(StrInput::new(&source), None).unwrap();
+        for (label, text) in [
+            ("absent", "(comment) @comment"),
+            ("dense", "(identifier) @name"),
+            ("context", "(function_definition body: (block (return_statement (binary_operator left: (identifier) @name))))"),
+            ("wildcard", "(_) @node"),
+        ] {
+            let query = Query::new(grammar, text, |_, _| Ok(())).unwrap();
+            let mut times = [Vec::new(), Vec::new()];
+            let mut counts = [0, 0];
+            for sample in 0..11 {
+                for mode in [sample % 2, 1 - sample % 2] {
+                    let end = if mode == 0 { source.len() as u32 + 1 } else { u32::MAX };
+                    let start = Instant::now();
+                    let mut cursor = InactiveQueryCursor::new(0..end, u32::MAX)
+                        .execute_query(&query, &tree.root_node(), StrInput::new(&source));
+                    let mut count = 0;
+                    while cursor.next_matched_node().is_some() { count += 1; }
+                    counts[mode] = count;
+                    times[mode].push(start.elapsed());
+                }
+            }
+            assert_eq!(counts[0], counts[1]);
+            for times in &mut times { times.sort_unstable(); }
+            eprintln!("QUERY {label}: original-path {:?}, fast-path {:?}, captures {}", times[0][5], times[1][5], counts[0]);
+        }
+    }
 }

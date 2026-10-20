@@ -3903,6 +3903,14 @@ static inline bool ts_query_cursor__advance(
   bool stop_on_definite_step
 ) {
   bool did_match = false;
+  bool unrestricted = self->included_range.start_byte == 0 &&
+    self->included_range.end_byte == UINT32_MAX &&
+    point_eq(self->included_range.start_point, POINT_ZERO) &&
+    point_eq(self->included_range.end_point, POINT_MAX) &&
+    self->containing_range.start_byte == 0 &&
+    self->containing_range.end_byte == UINT32_MAX &&
+    point_eq(self->containing_range.start_point, POINT_ZERO) &&
+    point_eq(self->containing_range.end_point, POINT_MAX);
   for (;;) {
     if (self->halted) {
       while (self->states.size > 0) {
@@ -4015,6 +4023,16 @@ static inline bool ts_query_cursor__advance(
     // Enter a new node.
     else {
       TSNode node = ts_tree_cursor_current_node(&self->cursor);
+      bool node_intersects_range = true;
+      bool node_intersects_containing_range = true;
+      // An unrestricted query with no pending match or possible pattern start
+      // needs no matching setup here. Descendants must still be visited.
+      if (unrestricted && self->states.size == 0 && self->query->wildcard_root_pattern_count == 0) {
+        unsigned pattern_index;
+        if (!ts_query__pattern_map_search(self->query, ts_node_symbol(node), &pattern_index)) {
+          goto descend;
+        }
+      }
       TSNode parent_node = ts_tree_cursor_parent_node(&self->cursor);
 
       bool parent_intersects_range =
@@ -4031,9 +4049,9 @@ static inline bool ts_query_cursor__advance(
         .start_byte = ts_node_start_byte(node),
         .end_byte = ts_node_end_byte(node),
       };
-      bool node_intersects_range =
+      node_intersects_range =
         parent_intersects_range && range_intersects(&node_range, &self->included_range);
-      bool node_intersects_containing_range =
+      node_intersects_containing_range =
         range_intersects(&node_range, &self->containing_range);
       bool node_within_containing_range =
         range_within(&node_range, &self->containing_range);
@@ -4428,6 +4446,7 @@ static inline bool ts_query_cursor__advance(
         }
       }
 
+    descend:
       if (node_intersects_containing_range && ts_query_cursor__should_descend(self, node_intersects_range)) {
         switch (ts_tree_cursor_goto_first_child_internal(&self->cursor)) {
           case TreeCursorStepVisible:

@@ -1,3 +1,4 @@
+mod query_performance;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
