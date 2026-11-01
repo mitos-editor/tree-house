@@ -10,3 +10,16 @@ Documentation is a work-in-progress and these crates may see breaking changes as
 * `highlighter/` contains the `tree-house` crate which exposes a robust highlighter and query iterator for working across [injections].
 * `skidder/` contains the `skidder` crate which exposes utilities for building a package repository for tree-sitter grammars.
 * `cli/` contains the `skidder-cli` crate which wraps `skidder` in a command line interface.
+### Necessary-byte prefilter for injection queries
+
+An injection pattern can declare a necessary ASCII byte with
+`(#set! injection.required-byte "/")`. This is a query-author assertion: every
+match of that pattern must require that byte somewhere in the source. It is not
+an extra predicate. For example, slash-delimited comment patterns can require
+`/`; a pattern matching arbitrary strings cannot.
+
+When every pattern declares the same byte and that byte is absent from the
+source, Tree-house can skip the tree query. Otherwise it executes the original
+query, including all predicates. Unannotated patterns and queries with different
+requirements retain the ordinary path. The source is scanned without flattening
+the rope, and an empty result still removes obsolete injection layers on edits.

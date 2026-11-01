@@ -27,6 +27,7 @@ pub struct InjectionProperties {
     include_children: IncludedChildren,
     language: Option<Box<str>>,
     combined: bool,
+    required_byte: Option<u8>,
 }
 
 /// An indicator in the document or query source file which used by the loader to know which
@@ -85,6 +86,7 @@ enum IncludedChildren {
 pub struct InjectionsQuery {
     injection_query: Query,
     injection_properties: HashMap<Pattern, InjectionProperties>,
+    required_byte: Option<u8>,
     injection_content_capture: Option<Capture>,
     injection_language_capture: Option<Capture>,
     injection_filename_capture: Option<Capture>,
@@ -134,12 +136,45 @@ impl InjectionsQuery {
                     key: "injection.combined",
                     val: None,
                 } => injection_properties.entry(pattern).or_default().combined = true,
+                UserPredicate::SetProperty {
+                    key: "injection.required-byte",
+                    val,
+                } => {
+                    let Some(value) = val.filter(|value| value.len() == 1 && value.is_ascii())
+                    else {
+                        return Err(InvalidPredicateError::Other {
+                            msg: "injection.required-byte requires exactly one ASCII byte".into(),
+                        });
+                    };
+                    let byte = value.as_bytes()[0];
+                    let properties = injection_properties.entry(pattern).or_default();
+                    if properties
+                        .required_byte
+                        .is_some_and(|previous| previous != byte)
+                    {
+                        return Err(InvalidPredicateError::Other {
+                            msg: "conflicting injection.required-byte properties".into(),
+                        });
+                    }
+                    properties.required_byte = Some(byte);
+                }
                 predicate => {
                     return Err(InvalidPredicateError::unknown(predicate));
                 }
             }
             Ok(())
         })?;
+        // A query-wide rejection is valid only if every pattern declares the
+        // same necessary byte. Any unannotated/mixed pattern keeps the full path.
+        let required_byte = injection_query
+            .patterns()
+            .map(|pattern| {
+                injection_properties
+                    .get(&pattern)
+                    .and_then(|p| p.required_byte)
+            })
+            .reduce(|first, next| if first == next { first } else { None })
+            .flatten();
         let mut local_query = Query::new(grammar, local_query_text, |pattern, predicate| {
             match predicate {
                 UserPredicate::SetProperty {
@@ -163,6 +198,7 @@ impl InjectionsQuery {
 
         Ok(InjectionsQuery {
             injection_properties,
+            required_byte,
             injection_content_capture: injection_query.get_capture("injection.content"),
             injection_language_capture: injection_query.get_capture("injection.language"),
             injection_filename_capture: injection_query.get_capture("injection.filename"),
@@ -286,11 +322,24 @@ impl InjectionsQuery {
         source: RopeSlice<'a>,
         loader: &'a impl LanguageLoader,
     ) -> impl Iterator<Item = InjectionQueryMatch<'a>> + 'a {
-        let mut cursor = InactiveQueryCursor::new(0..u32::MAX, TREE_SITTER_MATCH_LIMIT)
-            .execute_query(&self.injection_query, node, source);
+        // Scan the complete source conservatively, including bytes outside this
+        // layer's ranges. False positives only run the normal query. An empty
+        // iterator still goes through the caller's injection cleanup machinery.
+        let absent = self.required_byte.is_some_and(|byte| {
+            !source
+                .chunks()
+                .any(|chunk| chunk.as_bytes().contains(&byte))
+        });
+        let mut cursor = (!absent).then(|| {
+            InactiveQueryCursor::new(0..u32::MAX, TREE_SITTER_MATCH_LIMIT).execute_query(
+                &self.injection_query,
+                node,
+                source,
+            )
+        });
         let injection_content_capture = self.injection_content_capture.unwrap();
         let iter = iter::from_fn(move || loop {
-            let (query_match, node_idx) = cursor.next_matched_node()?;
+            let (query_match, node_idx) = cursor.as_mut()?.next_matched_node()?;
             if query_match.matched_node(node_idx).capture != injection_content_capture {
                 continue;
             }

@@ -18,6 +18,128 @@ use crate::{Language, Layer, Syntax};
 
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+#[test]
+fn required_byte_prefilter_preserves_injections_across_edits() {
+    let plain = r#"
+((line_comment) @injection.content (#set! injection.language "comment") (#set! injection.include-children))
+((block_comment) @injection.content (#set! injection.language "comment") (#set! injection.include-children))
+"#;
+    let required = plain.replace(
+        "(#set! injection.language",
+        "(#set! injection.required-byte \"/\") (#set! injection.language",
+    );
+    let mut reference_loader = TestLanguageLoader::new();
+    reference_loader.overwrite_injections("rust", plain.into());
+    let mut loader = TestLanguageLoader::new();
+    loader.overwrite_injections("rust", required);
+    let mut before = "fn main() {}";
+    let mut syntax =
+        Syntax::new(before.into(), loader.get("rust"), PARSE_TIMEOUT, &loader).unwrap();
+    for after in [
+        "fn main() { /* todo */ }",
+        "// note\nfn main() {}",
+        "fn main() {}",
+        "fn main() { let s = \"/\"; }",
+        "fn main() { /* again */ }",
+    ] {
+        let edit = InputEdit {
+            start_byte: 0,
+            old_end_byte: before.len() as u32,
+            new_end_byte: after.len() as u32,
+            start_point: Point::ZERO,
+            old_end_point: Point::ZERO,
+            new_end_point: Point::ZERO,
+        };
+        syntax
+            .update(after.into(), PARSE_TIMEOUT, &[edit], &loader)
+            .unwrap();
+        let fresh = Syntax::new(after.into(), loader.get("rust"), PARSE_TIMEOUT, &loader).unwrap();
+        let reference = Syntax::new(
+            after.into(),
+            reference_loader.get("rust"),
+            PARSE_TIMEOUT,
+            &reference_loader,
+        )
+        .unwrap();
+        for byte in 0..after.len() as u32 {
+            let languages = |syntax: &Syntax| {
+                syntax
+                    .layers_for_byte_range(byte, byte)
+                    .map(|layer| syntax.layer(layer).language)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(languages(&syntax), languages(&fresh));
+            assert_eq!(languages(&syntax), languages(&reference));
+        }
+        let has_comment_layer = (0..after.len() as u32).any(|byte| {
+            syntax
+                .layers_for_byte_range(byte, byte)
+                .any(|layer| syntax.layer(layer).language == loader.get("comment"))
+        });
+        assert_eq!(
+            has_comment_layer,
+            after.contains("/*") || after.starts_with("//")
+        );
+        before = after;
+    }
+}
+
+#[test]
+fn required_byte_prefilter_falls_back_for_unannotated_or_mixed_patterns() {
+    let comment = r#"((line_comment) @injection.content
+        (#set! injection.language "comment") (#set! injection.include-children) (#set! injection.required-byte "/"))"#;
+    for property in ["", "(#set! injection.required-byte \"#\")"] {
+        let query = format!("{comment}\n((string_literal) @injection.content (#set! injection.language \"comment\") (#set! injection.include-children) {property})");
+        let mut loader = TestLanguageLoader::new();
+        loader.overwrite_injections("rust", query);
+        let source = "fn main() { let text = \"#text\"; }";
+        let syntax =
+            Syntax::new(source.into(), loader.get("rust"), PARSE_TIMEOUT, &loader).unwrap();
+        let byte = source.find("#text").unwrap() as u32;
+        assert!(syntax
+            .layers_for_byte_range(byte, byte)
+            .any(|layer| syntax.layer(layer).language == loader.get("comment")));
+    }
+}
+
+#[test]
+fn required_byte_metadata_rejects_invalid_and_conflicting_values() {
+    let grammar = get_grammar("rust", &Overwrites::default()).grammar;
+    for property in [
+        "(#set! injection.required-byte)",
+        "(#set! injection.required-byte \"\")",
+        "(#set! injection.required-byte \"//\")",
+        "(#set! injection.required-byte \"é\")",
+        "(#set! injection.required-byte \"/\") (#set! injection.required-byte \"#\")",
+    ] {
+        let query = format!(
+            "((line_comment) @injection.content (#set! injection.language \"comment\") (#set! injection.include-children) {property})"
+        );
+        assert!(crate::injections_query::InjectionsQuery::new(grammar, &query, "").is_err());
+    }
+}
+
+#[test]
+fn required_byte_scan_covers_rope_chunks_and_nonzero_slices() {
+    let mut loader = TestLanguageLoader::new();
+    loader.overwrite_injections(
+        "rust",
+        r#"((line_comment) @injection.content
+        (#set! injection.language "comment") (#set! injection.include-children) (#set! injection.required-byte "/"))"#
+            .into(),
+    );
+    let prefix = "fn ignored() {}\n".repeat(100);
+    let body = format!("{}\n// last chunk comment", "fn main() {}\n".repeat(5_000));
+    let text = ropey::Rope::from_str(&format!("{prefix}{body}"));
+    let source = text.slice(prefix.len()..);
+    assert!(source.chunks().count() > 1);
+    let syntax = Syntax::new(source, loader.get("rust"), PARSE_TIMEOUT, &loader).unwrap();
+    let byte = body.find("//").unwrap() as u32;
+    assert!(syntax
+        .layers_for_byte_range(byte, byte)
+        .any(|layer| syntax.layer(layer).language == loader.get("comment")));
+}
+
 static GRAMMARS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     let skidder_config = skidder_config();
     skidder::fetch(&skidder_config, false).unwrap();
