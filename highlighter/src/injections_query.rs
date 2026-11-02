@@ -16,7 +16,7 @@ use crate::parse::LayerUpdateFlags;
 use crate::{Injection, Language, Layer, LayerData, Range, Syntax, TREE_SITTER_MATCH_LIMIT};
 use tree_sitter::{
     query::{self, InvalidPredicateError, UserPredicate},
-    Capture, Grammar, InactiveQueryCursor, MatchedNodeIdx, Node, Pattern, Query, QueryMatch,
+    Capture, Grammar, InactiveQueryCursor, MatchedNodeIdx, Pattern, Query, QueryMatch, Tree,
 };
 
 const SHEBANG: &str = r"#!\s*(?:\S*[/\\](?:env\s+(?:\-\S+\s+)*)?)?([^\s\.\d]+)";
@@ -53,19 +53,59 @@ pub enum InjectionLanguageMarker<'a> {
 }
 
 #[derive(Clone, Debug)]
-pub struct InjectionQueryMatch<'tree> {
+pub struct InjectionQueryMatch {
     include_children: IncludedChildren,
     language: Language,
     scope: Option<InjectionScope>,
-    node: Node<'tree>,
+    range: Range,
+    excluded: Vec<Range>,
     last_match: bool,
     pattern: Pattern,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum Marker {
+    Match(Range),
+    Filename(Range),
+    Shebang(Range),
+}
+#[derive(Clone, Debug)]
+pub(crate) struct InjectionEvent {
+    pattern: Pattern,
+    // Each child cursor has its own native match ids; the stream keeps them distinct.
+    id: (u32, u32),
+    marker: Option<Marker>,
+    range: Range,
+    excluded: Vec<Range>,
+    multiple_content: bool,
+    last_content: bool,
+}
+impl crate::subtree_query::Event for InjectionEvent {
+    fn shift(&mut self, offset: i64, stream: u32) {
+        self.id.0 = stream;
+        crate::subtree_query::shift_range(&mut self.range, offset);
+        for range in &mut self.excluded {
+            crate::subtree_query::shift_range(range, offset);
+        }
+        if let Some(Marker::Match(range) | Marker::Filename(range) | Marker::Shebang(range)) =
+            &mut self.marker
+        {
+            crate::subtree_query::shift_range(range, offset);
+        }
+    }
+    fn cacheable(&self) -> bool {
+        !self.multiple_content
+            && !self.range.is_empty()
+            && self.marker.as_ref().is_none_or(|m| match m {
+                Marker::Match(r) | Marker::Filename(r) | Marker::Shebang(r) => !r.is_empty(),
+            })
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum InjectionScope {
     Match {
-        id: u32,
+        id: (u32, u32),
     },
     Pattern {
         pattern: Pattern,
@@ -89,7 +129,6 @@ pub struct InjectionsQuery {
     injection_language_capture: Option<Capture>,
     injection_filename_capture: Option<Capture>,
     injection_shebang_capture: Option<Capture>,
-    // Note that the injections query is concatenated with the locals query.
     pub(crate) local_query: Query,
     // TODO: Use a Vec<bool> instead?
     pub(crate) not_scope_inherits: HashSet<Pattern>,
@@ -188,81 +227,108 @@ impl InjectionsQuery {
             .store(Arc::new(local_definition_captures));
     }
 
-    fn process_match<'a, 'tree>(
+    fn project_match(
         &self,
-        query_match: &QueryMatch<'a, 'tree>,
+        query_match: &QueryMatch<'_, '_>,
         node_idx: MatchedNodeIdx,
-        source: RopeSlice<'a>,
-        loader: impl LanguageLoader,
-    ) -> Option<InjectionQueryMatch<'tree>> {
+    ) -> Option<InjectionEvent> {
+        if Some(query_match.matched_node(node_idx).capture) != self.injection_content_capture {
+            return None;
+        }
         let properties = self.injection_properties.get(&query_match.pattern());
-
+        let include = properties.map(|p| p.include_children).unwrap_or_default();
         let mut marker = None;
-        let mut last_content_node = 0;
-        let mut content_nodes = 0;
-        for (i, matched_node) in query_match.matched_nodes().enumerate() {
-            let capture = Some(matched_node.capture);
+        let mut count = 0;
+        let mut last = 0;
+        for (i, node) in query_match.matched_nodes().enumerate() {
+            let capture = Some(node.capture);
             if capture == self.injection_language_capture {
-                let range = matched_node.node.byte_range();
-                marker = Some(InjectionLanguageMarker::Match(
-                    source.slice(range.start as usize..range.end as usize),
-                ));
+                marker = Some(Marker::Match(node.node.byte_range()));
             } else if capture == self.injection_filename_capture {
-                let range = matched_node.node.byte_range();
-                marker = Some(InjectionLanguageMarker::Filename(
-                    source.slice(range.start as usize..range.end as usize),
-                ));
+                marker = Some(Marker::Filename(node.node.byte_range()));
             } else if capture == self.injection_shebang_capture {
-                let range = matched_node.node.byte_range();
-                let node_slice = source.slice(range.start as usize..range.end as usize);
-
-                // some languages allow space and newlines before the actual string content
-                // so a shebang could be on either the first or second line
-                let lines = if 2 <= node_slice.len_lines(LineType::LF) {
-                    let end = node_slice.line_to_byte_idx(2, LineType::LF);
-                    node_slice.slice(..end)
-                } else {
-                    node_slice
-                };
-
-                marker = SHEBANG_REGEX
-                    .captures_iter(regex_cursor::Input::new(lines))
-                    .map(|cap| {
-                        let cap = lines.slice(cap.get_group(1).unwrap().range());
-                        InjectionLanguageMarker::Shebang(cap)
-                    })
-                    .next()
+                marker = Some(Marker::Shebang(node.node.byte_range()));
             } else if capture == self.injection_content_capture {
-                content_nodes += 1;
-
-                last_content_node = i as u32;
+                count += 1;
+                last = i as u32;
             }
         }
-        let marker = marker.or(properties
+        let node = &query_match.matched_node(node_idx).node;
+        let event = InjectionEvent {
+            pattern: query_match.pattern(),
+            id: (0, query_match.id()),
+            marker,
+            range: node.byte_range(),
+            excluded: node
+                .children()
+                .filter(|node| match include {
+                    IncludedChildren::None => true,
+                    IncludedChildren::All => false,
+                    IncludedChildren::Unnamed => node.is_named(),
+                })
+                .map(|n| n.byte_range())
+                .collect(),
+            multiple_content: count != 1,
+            last_content: last == node_idx,
+        };
+        Some(event)
+    }
+
+    // Resolve markers with the current source and loader, even for cached captures.
+    fn process_event(
+        &self,
+        event: InjectionEvent,
+        source: RopeSlice<'_>,
+        loader: &impl LanguageLoader,
+    ) -> Option<InjectionQueryMatch> {
+        let properties = self.injection_properties.get(&event.pattern);
+        let marker = match &event.marker {
+            Some(Marker::Match(range)) => Some(InjectionLanguageMarker::Match(
+                source.slice(range.start as usize..range.end as usize),
+            )),
+            Some(Marker::Filename(range)) => Some(InjectionLanguageMarker::Filename(
+                source.slice(range.start as usize..range.end as usize),
+            )),
+            Some(Marker::Shebang(range)) => {
+                let text = source.slice(range.start as usize..range.end as usize);
+                let lines = if 2 <= text.len_lines(LineType::LF) {
+                    text.slice(..text.line_to_byte_idx(2, LineType::LF))
+                } else {
+                    text
+                };
+                SHEBANG_REGEX
+                    .captures_iter(regex_cursor::Input::new(lines))
+                    .next()
+                    .map(|cap| {
+                        InjectionLanguageMarker::Shebang(
+                            lines.slice(cap.get_group(1).unwrap().range()),
+                        )
+                    })
+            }
+            None => None,
+        }
+        .or(properties
             .and_then(|p| p.language.as_deref())
             .map(InjectionLanguageMarker::Name))?;
-
         let language = loader.language_for_marker(marker)?;
         let scope = if properties.is_some_and(|p| p.combined) {
             Some(InjectionScope::Pattern {
-                pattern: query_match.pattern(),
+                pattern: event.pattern,
                 language,
             })
-        } else if content_nodes != 1 {
-            Some(InjectionScope::Match {
-                id: query_match.id(),
-            })
+        } else if event.multiple_content {
+            Some(InjectionScope::Match { id: event.id })
         } else {
             None
         };
-
         Some(InjectionQueryMatch {
             language,
             scope,
             include_children: properties.map(|p| p.include_children).unwrap_or_default(),
-            node: query_match.matched_node(node_idx).node.clone(),
-            last_match: last_content_node == node_idx,
-            pattern: query_match.pattern(),
+            range: event.range,
+            excluded: event.excluded,
+            last_match: event.last_content,
+            pattern: event.pattern,
         })
     }
 
@@ -280,32 +346,67 @@ impl InjectionsQuery {
     /// ```
     /// is possible and will always result in iteration order [range1, range2].
     /// This case should be handled by the calling function
+    #[allow(clippy::too_many_arguments)]
     fn execute<'a>(
         &'a self,
-        node: &Node<'a>,
+        tree: &'a Tree,
         source: RopeSlice<'a>,
         loader: &'a impl LanguageLoader,
-    ) -> impl Iterator<Item = InjectionQueryMatch<'a>> + 'a {
-        let mut cursor = InactiveQueryCursor::new(0..u32::MAX, TREE_SITTER_MATCH_LIMIT)
-            .execute_query(&self.injection_query, node, source);
-        let injection_content_capture = self.injection_content_capture.unwrap();
+        cache: &mut crate::subtree_query::SubtreeQueryCache<InjectionEvent>,
+        edits: &[tree_sitter::InputEdit],
+        ranges: &[tree_sitter::Range],
+        generation: u64,
+    ) -> impl Iterator<Item = InjectionQueryMatch> + 'a {
+        let events = cache.collect(
+            &self.injection_query,
+            tree,
+            source,
+            edits,
+            ranges,
+            generation,
+            |mat, idx| {
+                let event = self.project_match(&mat, idx);
+                if event.as_ref().is_some_and(|e| e.last_content) {
+                    // Release native capture storage after the final content capture.
+                    mat.remove();
+                }
+                event
+            },
+        );
+        let mut cursor = events.is_none().then(|| {
+            InactiveQueryCursor::new(0..u32::MAX, TREE_SITTER_MATCH_LIMIT).execute_query(
+                &self.injection_query,
+                &tree.root_node(),
+                source,
+            )
+        });
+        let mut events = events.map(Vec::into_iter);
         let iter = iter::from_fn(move || loop {
-            let (query_match, node_idx) = cursor.next_matched_node()?;
-            if query_match.matched_node(node_idx).capture != injection_content_capture {
-                continue;
+            if let Some(events) = &mut events {
+                let event = events.next()?;
+                if let Some(mat) = self
+                    .process_event(event, source, loader)
+                    .filter(|m| !m.range.is_empty())
+                {
+                    return Some(mat);
+                }
+            } else {
+                let (query_match, idx) = cursor.as_mut()?.next_matched_node()?;
+                if Some(query_match.matched_node(idx).capture) != self.injection_content_capture {
+                    continue;
+                }
+                let event = self.project_match(&query_match, idx).unwrap();
+                let Some(mat) = self.process_event(event, source, loader) else {
+                    query_match.remove();
+                    continue;
+                };
+                if mat.last_match {
+                    query_match.remove();
+                }
+                if !mat.range.is_empty() {
+                    return Some(mat);
+                }
             }
-            let Some(mat) = self.process_match(&query_match, node_idx, source, loader) else {
-                query_match.remove();
-                continue;
-            };
-            let range = query_match.matched_node(node_idx).node.byte_range();
-            if mat.last_match {
-                query_match.remove();
-            }
-            if range.is_empty() {
-                continue;
-            }
-            break Some(mat);
         });
         let mut buf = Vec::new();
         let mut iter = iter.peekable();
@@ -320,8 +421,7 @@ impl InjectionsQuery {
             // this is the default setting we have a fastpath for it
             if res.include_children == IncludedChildren::None {
                 let mut fast_return = true;
-                while let Some(overlap) =
-                    iter.next_if(|mat| mat.node.byte_range() == res.node.byte_range())
+                while let Some(overlap) = iter.next_if(|mat| mat.range.clone() == res.range.clone())
                 {
                     if overlap.include_children != IncludedChildren::None {
                         buf.push(overlap);
@@ -338,15 +438,14 @@ impl InjectionsQuery {
 
             // we if can't use the fastpath we accumulate all overlapping matches
             // and then sort them according to precedence rules...
-            while let Some(overlap) = iter.next_if(|mat| mat.node.end_byte() <= res.node.end_byte())
-            {
+            while let Some(overlap) = iter.next_if(|mat| mat.range.end <= res.range.end) {
                 buf.push(overlap)
             }
             if buf.is_empty() {
                 return Some(res);
             }
             buf.push(res);
-            buf.sort_unstable_by_key(|mat| (mat.pattern, Reverse(mat.node.start_byte())));
+            buf.sort_unstable_by_key(|mat| (mat.pattern, Reverse(mat.range.start)));
             buf.pop()
         })
     }
@@ -361,6 +460,7 @@ impl Syntax {
         loader: &impl LanguageLoader,
         mut parse_layer: impl FnMut(Layer),
     ) {
+        let generation = self.query_generation;
         self.map_injections(layer, None, edits);
         let layer_data = &mut self.layer_mut(layer);
         let Some(LanguageConfig {
@@ -380,11 +480,19 @@ impl Syntax {
         let mut injections: Vec<Injection> = Vec::with_capacity(layer_data.injections.len());
         let mut old_injections = take(&mut layer_data.injections).into_iter().peekable();
 
-        let injection_query = injections_query.execute(&parse_tree.root_node(), source, loader);
+        let injection_query = injections_query.execute(
+            &parse_tree,
+            source,
+            loader,
+            &mut layer_data.injection_cache,
+            edits,
+            &parent_ranges,
+            generation,
+        );
 
         let mut combined_injections: HashMap<InjectionScope, Layer> = HashMap::with_capacity(32);
         for mat in injection_query {
-            let matched_node_range = mat.node.byte_range();
+            let matched_node_range = mat.range.clone();
             let mut insert_position = injections.len();
             // if a parent node already has an injection ignore this injection
             // in theory the first condition would be enough to detect that
@@ -446,7 +554,11 @@ impl Syntax {
             }
 
             let old_len = injections.len();
-            for range in intersect_ranges(mat.include_children, mat.node, &parent_ranges) {
+            for range in intersect_ranges_impl(
+                mat.range,
+                mat.excluded.into_iter(),
+                parent_ranges.iter().map(|r| r.start_byte..r.end_byte),
+            ) {
                 layer_data.ranges.push(tree_sitter::Range::new(
                     tree_sitter::Point::ZERO,
                     tree_sitter::Point::ZERO,
@@ -600,6 +712,8 @@ impl Syntax {
                     flags: LayerUpdateFlags::default(),
                     parent: Some(parent),
                     locals: Locals::default(),
+                    local_cache: Default::default(),
+                    injection_cache: Default::default(),
                 });
                 Layer(layer as u32)
             }
@@ -631,28 +745,6 @@ impl Syntax {
             })
             .clone()
     }
-}
-
-fn intersect_ranges<'tree, 'p>(
-    include_children: IncludedChildren,
-    node: Node<'tree>,
-    parent_ranges: &'p [tree_sitter::Range],
-) -> impl Iterator<Item = Range> + use<'tree, 'p> {
-    let range = node.byte_range();
-    let i = parent_ranges.partition_point(|parent_range| parent_range.end_byte <= range.start);
-    let parent_ranges = parent_ranges[i..]
-        .iter()
-        .map(|range| range.start_byte..range.end_byte);
-    let excluded_ranges = node
-        .children()
-        .filter(move |node| match include_children {
-            IncludedChildren::None => true,
-            IncludedChildren::All => false,
-            IncludedChildren::Unnamed => node.is_named(),
-        })
-        .map(|n| n.byte_range());
-
-    intersect_ranges_impl(range, excluded_ranges, parent_ranges)
 }
 
 /// Creates an iterator over the subtraction of one set of ranges from another.

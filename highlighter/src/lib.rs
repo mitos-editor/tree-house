@@ -21,6 +21,7 @@ mod config;
 pub mod highlighter;
 mod injections_query;
 mod parse;
+mod subtree_query;
 #[cfg(all(test, feature = "fixtures"))]
 mod tests;
 // mod pretty_print;
@@ -84,6 +85,7 @@ impl Language {
 /// such multi injection nodes.
 #[derive(Debug, Clone)]
 pub struct Syntax {
+    query_generation: u64,
     layers: Slab<LayerData>,
     root: Layer,
 }
@@ -108,10 +110,13 @@ impl Syntax {
             injections: Vec::new(),
             parent: None,
             locals: Locals::default(),
+            local_cache: Default::default(),
+            injection_cache: Default::default(),
         };
         let mut layers = Slab::with_capacity(32);
         let root = layers.insert(root_layer);
         let mut syntax = Self {
+            query_generation: 0,
             root: Layer(root as u32),
             layers,
         };
@@ -224,6 +229,8 @@ pub struct LayerData {
     flags: LayerUpdateFlags,
     parent: Option<Layer>,
     locals: Locals,
+    local_cache: subtree_query::SubtreeQueryCache<locals::LocalEvent>,
+    injection_cache: subtree_query::SubtreeQueryCache<injections_query::InjectionEvent>,
 }
 
 /// This PartialEq implementation only checks if that
@@ -354,6 +361,8 @@ mod unit_tests {
             flags: LayerUpdateFlags::default(),
             parent: None,
             locals: Locals::default(),
+            local_cache: Default::default(),
+            injection_cache: Default::default(),
         }
     }
 

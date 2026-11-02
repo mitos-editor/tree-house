@@ -22,6 +22,7 @@ impl Syntax {
             return Err(Error::ExceededMaximumSize);
         }
 
+        self.query_generation = self.query_generation.wrapping_add(1);
         let mut queue = Vec::with_capacity(32);
         let root_flags = &mut self.layer_mut(self.root).flags;
         // The root layer is always considered.
@@ -56,7 +57,7 @@ impl Syntax {
                 layer_data.parse(&mut parser, source, timeout, loader)?;
             }
             self.run_injection_query(layer, edits, source, loader, |layer| queue.push(layer));
-            self.run_local_query(layer, source, loader);
+            self.run_local_query(layer, source, loader, edits);
         }
 
         if self.layer(self.root).parse_tree.is_none() {
