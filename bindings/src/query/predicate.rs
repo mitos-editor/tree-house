@@ -140,6 +140,8 @@ impl Query {
         mut custom_predicate: impl FnMut(Pattern, UserPredicate) -> Result<(), InvalidPredicateError>,
         prefilter: &mut prefilter::Builder,
     ) -> Result<PatternData, InvalidPredicateError> {
+        // Predicates in one pattern must all pass. A requirement from any one
+        // positive predicate is enough to rule out that pattern.
         let mut required = None;
         let derive = prefilter.enabled();
         let text_predicate_start = self.text_predicates.len() as u32;

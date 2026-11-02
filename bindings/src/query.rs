@@ -76,6 +76,8 @@ unsafe impl Send for Query {}
 unsafe impl Sync for Query {}
 
 impl Query {
+    /// Check the complete node: predicate captures can lie outside the cursor
+    /// range used to select returned captures. A positive result is only a candidate.
     pub(crate) fn could_match(
         &self,
         input: &mut impl crate::Input,
@@ -321,7 +323,8 @@ impl Query {
     /// any resource usage associated with recording the capture. Currently, there
     /// is no way to undo this.
     pub fn disable_capture(&mut self, name: &str) {
-        // Removing a capture can make an all-captures predicate vacuously true.
+        // An all-captures predicate may pass after its captures are removed,
+        // so its old literal requirement no longer applies.
         self.prefilter = None;
         let bytes = name.as_bytes();
         unsafe {
@@ -504,6 +507,7 @@ enum RawQueryError {
     Language = 6,
 }
 
+// Values match TSQuantifier in vendor/include/tree_sitter/api.h.
 #[repr(u32)]
 #[allow(dead_code)] // Constructed by the C API, not by Rust code.
 enum CaptureQuantifier {
@@ -515,6 +519,8 @@ enum CaptureQuantifier {
 }
 
 impl Query {
+    // An all-captures predicate can pass with no captures. Only a capture
+    // that must appear supplies a necessary text requirement.
     fn capture_required(&self, pattern: Pattern, capture: Capture) -> bool {
         match unsafe { ts_query_capture_quantifier_for_id(self.raw, pattern.0, capture.0) } {
             CaptureQuantifier::One | CaptureQuantifier::OneOrMore => true,

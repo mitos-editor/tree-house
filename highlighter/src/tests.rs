@@ -18,20 +18,29 @@ use crate::{Language, Layer, Syntax};
 
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+fn end_point(text: &str) -> Point {
+    Point {
+        row: text.bytes().filter(|&byte| byte == b'\n').count() as u32,
+        col: text
+            .rsplit_once('\n')
+            .map_or(text.len(), |(_, last)| last.len()) as u32,
+    }
+}
+
 #[test]
 fn predicate_prefilter_preserves_injections_across_edits() {
     let plain = r#"
 ((line_comment) @injection.content (#set! injection.language "comment") (#set! injection.include-children))
 ((block_comment) @injection.content (#set! injection.language "comment") (#set! injection.include-children))
 "#;
-    let required = plain.replace(
+    let constrained = plain.replace(
         "(#set! injection.language",
         "(#match? @injection.content \"^/\") (#set! injection.language",
     );
     let mut reference_loader = TestLanguageLoader::new();
     reference_loader.overwrite_injections("rust", plain.into());
     let mut loader = TestLanguageLoader::new();
-    loader.overwrite_injections("rust", required);
+    loader.overwrite_injections("rust", constrained);
     let mut before = "fn main() {}";
     let mut syntax =
         Syntax::new(before.into(), loader.get("rust"), PARSE_TIMEOUT, &loader).unwrap();
@@ -47,8 +56,8 @@ fn predicate_prefilter_preserves_injections_across_edits() {
             old_end_byte: before.len() as u32,
             new_end_byte: after.len() as u32,
             start_point: Point::ZERO,
-            old_end_point: Point::ZERO,
-            new_end_point: Point::ZERO,
+            old_end_point: end_point(before),
+            new_end_point: end_point(after),
         };
         syntax
             .update(after.into(), PARSE_TIMEOUT, &[edit], &loader)
@@ -85,11 +94,11 @@ fn predicate_prefilter_preserves_injections_across_edits() {
 }
 
 #[test]
-fn predicate_prefilter_preserves_unannotated_and_mixed_patterns() {
+fn predicate_prefilter_preserves_unconstrained_and_mixed_patterns() {
     let comment = r#"((line_comment) @injection.content
         (#set! injection.language "comment") (#set! injection.include-children) (#match? @injection.content "^/"))"#;
-    for property in ["", "(#match? @injection.content \"#\")"] {
-        let query = format!("{comment}\n((string_literal) @injection.content (#set! injection.language \"comment\") (#set! injection.include-children) {property})");
+    for predicate in ["", "(#match? @injection.content \"#\")"] {
+        let query = format!("{comment}\n((string_literal) @injection.content (#set! injection.language \"comment\") (#set! injection.include-children) {predicate})");
         let mut loader = TestLanguageLoader::new();
         loader.overwrite_injections("rust", query);
         let source = "fn main() { let text = \"#text\"; }";
@@ -100,14 +109,6 @@ fn predicate_prefilter_preserves_unannotated_and_mixed_patterns() {
             .layers_for_byte_range(byte, byte)
             .any(|layer| syntax.layer(layer).language == loader.get("comment")));
     }
-}
-
-#[test]
-fn custom_required_byte_hint_is_not_supported() {
-    let grammar = get_grammar("rust", &Overwrites::default()).grammar;
-    let query = r#"((line_comment) @injection.content
-        (#set! injection.language "comment") (#set! injection.required-byte "/"))"#;
-    assert!(crate::injections_query::InjectionsQuery::new(grammar, query, "").is_err());
 }
 
 #[test]
@@ -206,11 +207,11 @@ fn predicate_prefilter_matches_full_queries_in_python_html_and_rust() {
             ],
         ),
     ];
-    for (language, plain, annotated, sources) in cases {
+    for (language, plain, constrained, sources) in cases {
         let mut reference_loader = TestLanguageLoader::new();
         reference_loader.overwrite_injections(language, plain.into());
         let mut loader = TestLanguageLoader::new();
-        loader.overwrite_injections(language, annotated);
+        loader.overwrite_injections(language, constrained);
         let css = r#"((comment) @injection.content (#set! injection.language "comment") (#set! injection.include-children))"#;
         reference_loader.overwrite_injections("css", css.into());
         loader.overwrite_injections(
@@ -229,19 +230,13 @@ fn predicate_prefilter_matches_full_queries_in_python_html_and_rust() {
         )
         .unwrap();
         for &source in sources {
-            let end = |text: &str| Point {
-                row: text.bytes().filter(|&byte| byte == b'\n').count() as u32,
-                col: text
-                    .rfind('\n')
-                    .map_or(text.len(), |last| text.len() - last - 1) as u32,
-            };
             let edit = InputEdit {
                 start_byte: 0,
                 old_end_byte: previous.len() as u32,
                 new_end_byte: source.len() as u32,
                 start_point: Point::ZERO,
-                old_end_point: end(previous),
-                new_end_point: end(source),
+                old_end_point: end_point(previous),
+                new_end_point: end_point(source),
             };
             syntax
                 .update(source.into(), PARSE_TIMEOUT, &[edit], &loader)

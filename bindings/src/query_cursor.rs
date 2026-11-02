@@ -25,6 +25,7 @@ pub struct QueryCursor<'a, 'tree, I: Input> {
     ptr: NonNull<QueryCursorData>,
     tree: PhantomData<&'tree Tree>,
     input: I,
+    // The compiled text requirements rule out every pattern for this source.
     rejected: bool,
 }
 
@@ -193,6 +194,8 @@ impl InactiveQueryCursor {
         let mut input = input.into_input();
         let rejected = !query.could_match(&mut input, node);
         let ptr = self.ptr;
+        // Reset native state even after rejection, so pooled cursors and their
+        // match-limit status always belong to this execution.
         unsafe { ts_query_cursor_exec(ptr.as_ptr(), query.raw.as_ref(), node.as_raw()) };
         mem::forget(self);
         QueryCursor {

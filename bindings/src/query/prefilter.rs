@@ -1,4 +1,6 @@
-//! Conservative query-wide requirements derived from ordinary text predicates.
+//! Skip a query only when none of its patterns can match the searched node.
+//! Each pattern supplies literals required by one positive text predicate.
+//! Finding a literal permits the normal query to run; it does not prove a match.
 use std::ops::Range;
 
 use regex_cursor::{engines::meta::Regex, Cursor};
@@ -6,21 +8,25 @@ use regex_syntax::hir::{literal::Extractor, Hir};
 
 use crate::Input;
 
+// Keep optional prefilter compilation small. Exceeding these limits runs the full query.
 const MAX_LITERALS: usize = 64;
 const MAX_LITERAL_LEN: usize = 64;
 const MAX_LITERAL_BYTES: usize = MAX_LITERALS * MAX_LITERAL_LEN;
 
 pub(super) type Literals = Vec<Vec<u8>>;
 
-/// Patterns are alternatives. An unknown alternative disables whole-query rejection.
+/// Collect requirements from every alternative in a query.
+/// `None` means at least one pattern has no usable requirement.
 pub(super) struct Builder(Option<Literals>);
 impl Builder {
     pub(super) fn new() -> Self {
         Self(Some(Vec::new()))
     }
+    /// Once a pattern prevents prefiltering, later patterns cannot restore it.
     pub(super) fn enabled(&self) -> bool {
         self.0.is_some()
     }
+    /// Any one pattern can match, so retain literals from all of them.
     pub(super) fn pattern(&mut self, required: Option<Literals>) {
         self.0 = self.0.take().zip(required).and_then(|(mut all, next)| {
             if all.len() + next.len() > MAX_LITERALS {
@@ -47,6 +53,7 @@ impl Builder {
                     return None;
                 }
                 let hirs: Vec<_> = literals.into_iter().map(Hir::literal).collect();
+                // An optional optimization must not fail an otherwise valid query.
                 Regex::builder()
                     .build_many_from_hir(&hirs)
                     .ok()
@@ -74,7 +81,8 @@ pub(super) fn literals<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> Option
 }
 
 pub(super) fn regex_literals(hir: &Hir) -> Option<Literals> {
-    // The library weakens anchors/boundaries and bounds expansion conservatively.
+    // A capture can start inside the searched node. Extraction ignores anchors
+    // and boundaries here; the original regex checks them on the capture later.
     let sequence = Extractor::new()
         .limit_total(MAX_LITERALS)
         .limit_literal_len(MAX_LITERAL_LEN)
@@ -93,6 +101,7 @@ pub(super) enum Prefilter {
     Literals(Regex),
 }
 impl Prefilter {
+    /// `false` rules out a match; `true` still requires normal query execution.
     pub(crate) fn may_match(&self, input: &mut impl Input, range: Range<u32>) -> bool {
         let cursor = input.cursor_at(range.start);
         match self {

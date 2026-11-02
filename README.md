@@ -10,12 +10,12 @@ Documentation is a work-in-progress and these crates may see breaking changes as
 * `highlighter/` contains the `tree-house` crate which exposes a robust highlighter and query iterator for working across [injections].
 * `skidder/` contains the `skidder` crate which exposes utilities for building a package repository for tree-sitter grammars.
 * `cli/` contains the `skidder-cli` crate which wraps `skidder` in a command line interface.
-### Predicate-derived query prefilters
 
-The query engine derives necessary literals from ordinary positive text
-predicates: `#eq?`, `#any-of?`, `#match?` and their existential `#any-*` forms.
-No custom optimization properties or language-specific Rust code are needed.
-For example, a query for slash-prefixed comments can use a normal predicate:
+### Query prefilters
+
+The query engine can skip a subtree when its text lacks literals required by
+`#eq?`, `#any-of?` or `#match?`, including `#any-eq?` and `#any-match?`.
+For example:
 
 ```scheme
 ((comment) @injection.content
@@ -23,35 +23,15 @@ For example, a query for slash-prefixed comments can use a normal predicate:
  (#set! injection.language "comment"))
 ```
 
-This predicate retains its ordinary meaning. The compiler can additionally prove
-that a match requires `/`, and query cursors can reject a slash-free subtree
-before walking its nodes. A present literal only permits normal execution;
-all predicates, capture ordering and query semantics are still checked.
+Without `/` in the subtree, this query cannot match. If `/` is present, the
+normal query and its predicates still run. The optimization needs no extra
+query properties and preserves match and capture results.
 
-Each pattern contributes a necessary condition from a positive predicate.
-Patterns are alternatives, so a whole query can be rejected only when all of
-its alternatives are impossible. One pattern without a sound, nonempty literal
-requirement disables rejection for the query. Negated predicates and
-capture-to-capture comparisons supply no literal requirement. Predicates over
-all captures require a nonoptional capture; existential predicates already
-require at least one capture. Tree-sitter's public capture-quantifier API
-provides this distinction.
+A pattern without a safe text requirement keeps the whole query on the normal
+path. This includes optional captures that can let a predicate pass without
+reading text. Large or unsupported literal requirements also use normal
+execution. Regex literal extraction handles anchors, Unicode and alternatives;
+searches work across source chunks without copying the complete source.
 
-Regex predicates are parsed once. Their HIR builds the ordinary matcher and
-feeds `regex-syntax`'s conservative literal extractor. Anchors, boundaries,
-Unicode case folding, alternatives and empty matches are handled by that
-library, not by inspecting regex strings. Extraction is bounded to 64 literals
-of at most 64 bytes each, with at most 4 KiB of literal payload. Unsupported,
-empty, over-budget or truncated UTF-8 requirements retain full execution.
-
-Compiled plans are immutable. Single-byte requirements use a direct chunk scan;
-other literal sets use the existing cursor-based regex engine, including
-matches spanning chunks. Scans cover the queried node's entire byte span,
-not just the cursor's narrower capture range, and never flatten the source.
-Disabling captures discards the plan because it can make an all-captures
-predicate vacuously true. Removing patterns leaves its conservative proof valid.
-
-This optimization belongs to the generic query engine and is independent of
-injection discovery and incremental query-result caching. Language packages
-continue to own ordinary query semantics. An opaque node name such as
-`comment` does not by itself prove a particular delimiter.
+A node name such as `comment` does not imply a delimiter. Language packages
+remain responsible for their ordinary query semantics.
