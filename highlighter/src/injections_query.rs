@@ -19,6 +19,9 @@ use tree_sitter::{
     Capture, Grammar, InactiveQueryCursor, MatchedNodeIdx, Node, Pattern, Query, QueryMatch,
 };
 
+mod prefilter;
+use prefilter::{Prefilter, RequiredByte};
+
 const SHEBANG: &str = r"#!\s*(?:\S*[/\\](?:env\s+(?:\-\S+\s+)*)?)?([^\s\.\d]+)";
 static SHEBANG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(SHEBANG).unwrap());
 
@@ -27,7 +30,7 @@ pub struct InjectionProperties {
     include_children: IncludedChildren,
     language: Option<Box<str>>,
     combined: bool,
-    required_byte: Option<u8>,
+    required_byte: Option<RequiredByte>,
 }
 
 /// An indicator in the document or query source file which used by the loader to know which
@@ -86,7 +89,7 @@ enum IncludedChildren {
 pub struct InjectionsQuery {
     injection_query: Query,
     injection_properties: HashMap<Pattern, InjectionProperties>,
-    required_byte: Option<u8>,
+    prefilter: Prefilter,
     injection_content_capture: Option<Capture>,
     injection_language_capture: Option<Capture>,
     injection_filename_capture: Option<Capture>,
@@ -140,13 +143,7 @@ impl InjectionsQuery {
                     key: "injection.required-byte",
                     val,
                 } => {
-                    let Some(value) = val.filter(|value| value.len() == 1 && value.is_ascii())
-                    else {
-                        return Err(InvalidPredicateError::Other {
-                            msg: "injection.required-byte requires exactly one ASCII byte".into(),
-                        });
-                    };
-                    let byte = value.as_bytes()[0];
+                    let byte = RequiredByte::parse(val)?;
                     let properties = injection_properties.entry(pattern).or_default();
                     if properties
                         .required_byte
@@ -164,17 +161,11 @@ impl InjectionsQuery {
             }
             Ok(())
         })?;
-        // A query-wide rejection is valid only if every pattern declares the
-        // same necessary byte. Any unannotated/mixed pattern keeps the full path.
-        let required_byte = injection_query
-            .patterns()
-            .map(|pattern| {
-                injection_properties
-                    .get(&pattern)
-                    .and_then(|p| p.required_byte)
-            })
-            .reduce(|first, next| if first == next { first } else { None })
-            .flatten();
+        let prefilter = Prefilter::compile(injection_query.patterns().map(|pattern| {
+            injection_properties
+                .get(&pattern)
+                .and_then(|properties| properties.required_byte)
+        }));
         let mut local_query = Query::new(grammar, local_query_text, |pattern, predicate| {
             match predicate {
                 UserPredicate::SetProperty {
@@ -198,7 +189,7 @@ impl InjectionsQuery {
 
         Ok(InjectionsQuery {
             injection_properties,
-            required_byte,
+            prefilter,
             injection_content_capture: injection_query.get_capture("injection.content"),
             injection_language_capture: injection_query.get_capture("injection.language"),
             injection_filename_capture: injection_query.get_capture("injection.filename"),
@@ -322,14 +313,8 @@ impl InjectionsQuery {
         source: RopeSlice<'a>,
         loader: &'a impl LanguageLoader,
     ) -> impl Iterator<Item = InjectionQueryMatch<'a>> + 'a {
-        // Scan the complete source conservatively, including bytes outside this
-        // layer's ranges. False positives only run the normal query. An empty
-        // iterator still goes through the caller's injection cleanup machinery.
-        let absent = self.required_byte.is_some_and(|byte| {
-            !source
-                .chunks()
-                .any(|chunk| chunk.as_bytes().contains(&byte))
-        });
+        // Keep the normal reconciliation path even when no pattern can match.
+        let absent = !self.prefilter.may_match(source, node.byte_range());
         let mut cursor = (!absent).then(|| {
             InactiveQueryCursor::new(0..u32::MAX, TREE_SITTER_MATCH_LIMIT).execute_query(
                 &self.injection_query,

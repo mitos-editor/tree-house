@@ -85,7 +85,7 @@ fn required_byte_prefilter_preserves_injections_across_edits() {
 }
 
 #[test]
-fn required_byte_prefilter_falls_back_for_unannotated_or_mixed_patterns() {
+fn required_byte_prefilter_preserves_unannotated_and_mixed_patterns() {
     let comment = r#"((line_comment) @injection.content
         (#set! injection.language "comment") (#set! injection.include-children) (#set! injection.required-byte "/"))"#;
     for property in ["", "(#set! injection.required-byte \"#\")"] {
@@ -138,6 +138,190 @@ fn required_byte_scan_covers_rope_chunks_and_nonzero_slices() {
     assert!(syntax
         .layers_for_byte_range(byte, byte)
         .any(|layer| syntax.layer(layer).language == loader.get("comment")));
+}
+
+#[test]
+fn required_byte_prefilter_matches_full_queries_in_python_html_and_rust() {
+    let python = r#"
+((comment) @injection.content
+ (#set! injection.language "comment") (#set! injection.include-children))
+((string (string_content) @injection.content)
+ (#match? @injection.content "^fn ")
+ (#set! injection.language "rust") (#set! injection.include-children))
+"#;
+    let html = r#"
+((comment) @injection.content
+ (#set! injection.language "comment") (#set! injection.include-children))
+((style_element (raw_text) @injection.content)
+ (#set! injection.language "css") (#set! injection.include-children))
+"#;
+    let rust = r#"
+((line_comment) @injection.content
+ (#set! injection.language "comment") (#set! injection.include-children))
+((block_comment) @injection.content
+ (#set! injection.language "comment") (#set! injection.include-children))
+"#;
+    let cases: [(&str, &str, String, &[&str]); 3] = [
+        (
+            "python",
+            python,
+            python
+                .replace(
+                    "(#set! injection.language \"comment\")",
+                    "(#set! injection.required-byte \"#\") (#set! injection.language \"comment\")",
+                )
+                .replace(
+                    "(#set! injection.language \"rust\")",
+                    "(#set! injection.required-byte \"f\") (#set! injection.language \"rust\")",
+                ),
+            &[
+                "value = 1\n",
+                "# todo café\nvalue = 1\n",
+                "code = \"fn inner() {}\"\n",
+                "code = \"fn inner() { /* 日本語 */ }\"\n",
+                "code = \"# false positive f\"\n",
+                "value = 2\n",
+            ],
+        ),
+        (
+            "html",
+            html,
+            html.replace(
+                "(#set! injection.language",
+                "(#set! injection.required-byte \"<\") (#set! injection.language",
+            ),
+            &[
+                "plain é日 text",
+                "<!-- todo -->plain text",
+                "<style>body { color: red; }</style>",
+                "<!-- / outside CSS --><style>body { color: red; }</style>",
+                "<style>/* todo */ body { color: red; }</style>",
+                "<style>body { color: red; }</style>",
+                "plain text",
+            ],
+        ),
+        (
+            "rust",
+            rust,
+            rust.replace(
+                "(#set! injection.language",
+                "(#set! injection.required-byte \"/\") (#set! injection.language",
+            ),
+            &[
+                "fn main() {}",
+                "// todo 日本語\nfn main() {}",
+                "fn main() { /* café */ }",
+                "fn main() { let text = \"/ false positive\"; }",
+                "fn main() {}",
+            ],
+        ),
+    ];
+    for (language, plain, annotated, sources) in cases {
+        let mut reference_loader = TestLanguageLoader::new();
+        reference_loader.overwrite_injections(language, plain.into());
+        let mut loader = TestLanguageLoader::new();
+        loader.overwrite_injections(language, annotated);
+        let css = r#"((comment) @injection.content (#set! injection.language "comment") (#set! injection.include-children))"#;
+        reference_loader.overwrite_injections("css", css.into());
+        loader.overwrite_injections(
+            "css",
+            css.replace(
+                "(#set! injection.language",
+                "(#set! injection.required-byte \"/\") (#set! injection.language",
+            ),
+        );
+        let mut previous = sources[0];
+        let mut syntax = Syntax::new(
+            previous.into(),
+            loader.get(language),
+            PARSE_TIMEOUT,
+            &loader,
+        )
+        .unwrap();
+        for &source in sources {
+            let end = |text: &str| Point {
+                row: text.bytes().filter(|&byte| byte == b'\n').count() as u32,
+                col: text
+                    .rfind('\n')
+                    .map_or(text.len(), |last| text.len() - last - 1) as u32,
+            };
+            let edit = InputEdit {
+                start_byte: 0,
+                old_end_byte: previous.len() as u32,
+                new_end_byte: source.len() as u32,
+                start_point: Point::ZERO,
+                old_end_point: end(previous),
+                new_end_point: end(source),
+            };
+            syntax
+                .update(source.into(), PARSE_TIMEOUT, &[edit], &loader)
+                .unwrap();
+            let full = Syntax::new(
+                source.into(),
+                reference_loader.get(language),
+                PARSE_TIMEOUT,
+                &reference_loader,
+            )
+            .unwrap();
+            let nested = match language {
+                "python" if source.contains("\"fn ") => Some("rust"),
+                "html" if source.contains("<style>") => Some("css"),
+                _ => None,
+            };
+            if let Some(nested) = nested {
+                assert!(
+                    full.layers
+                        .iter()
+                        .any(|(_, layer)| { layer.language == reference_loader.get(nested) }),
+                    "the reference must exercise {language} -> {nested}"
+                );
+            }
+            assert_eq!(
+                prefilter_observation(&syntax, source, &loader),
+                prefilter_observation(&full, source, &reference_loader),
+                "{language}: {source:?}"
+            );
+            previous = source;
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn prefilter_observation(
+    syntax: &Syntax,
+    source: &str,
+    loader: &TestLanguageLoader,
+) -> (Vec<(u32, Vec<String>)>, Vec<(u32, Vec<(u32, u32)>)>) {
+    let mut highlighter = Highlighter::new(syntax, source.into(), loader, 0..source.len() as u32);
+    let mut highlights = Vec::new();
+    while highlighter.next_event_offset() != u32::MAX {
+        let offset = highlighter.next_event_offset();
+        highlighter.advance();
+        highlights.push((
+            offset,
+            highlighter
+                .active_highlights()
+                .map(|highlight| loader.test_theme.borrow()[highlight.idx()].clone())
+                .collect(),
+        ));
+        assert!(highlights.len() < source.len() * 20 + 100);
+    }
+    let mut layers = syntax
+        .layers
+        .iter()
+        .map(|(_, layer)| {
+            (
+                layer.language.0,
+                layer
+                    .ranges
+                    .iter()
+                    .map(|range| (range.start_byte, range.end_byte))
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    layers.sort();
+    (highlights, layers)
 }
 
 static GRAMMARS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
