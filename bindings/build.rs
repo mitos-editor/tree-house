@@ -8,6 +8,18 @@ fn main() {
     let mut config = cc::Build::new();
 
     let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // extended.c reads private query steps. Require an explicit review whenever
+    // the authoritative vendoring script selects another Tree-sitter revision.
+    println!("cargo:rerun-if-changed=vendor.sh");
+    let vendor_script = fs::read_to_string(manifest_path.join("vendor.sh")).unwrap();
+    let revision = vendor_script
+        .lines()
+        .find_map(|line| line.strip_prefix("BRANCH="));
+    assert_eq!(
+        revision,
+        Some("v0.27.1"),
+        "Review src/extended.c and its query eligibility tests before updating Tree-sitter"
+    );
     let include_path = manifest_path.join("vendor/include");
     let src_path = manifest_path.join("vendor/src");
     for entry in fs::read_dir(&src_path).unwrap() {

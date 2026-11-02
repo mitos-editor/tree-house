@@ -84,7 +84,7 @@ fn get_grammar(lang_name: &str, overwrites: &Overwrites) -> LanguageConfig {
 }
 
 #[derive(Debug)]
-struct TestLanguageLoader {
+pub(crate) struct TestLanguageLoader {
     languages: IndexMap<String, Language>,
     lang_config: Box<[OnceCell<LanguageConfig>]>,
     overwrites: Box<[Overwrites]>,
@@ -94,7 +94,7 @@ struct TestLanguageLoader {
 }
 
 impl TestLanguageLoader {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let grammars = &GRAMMARS;
 
         Self {
@@ -115,7 +115,7 @@ impl TestLanguageLoader {
         }
     }
 
-    fn get(&self, name: &str) -> Language {
+    pub(crate) fn get(&self, name: &str) -> Language {
         self.languages[name]
     }
 
@@ -849,6 +849,9 @@ fn cached_queries_only_project_changed_subtrees_and_reset_after_gaps() {
         fn cacheable(&self) -> bool {
             !self.0.is_empty()
         }
+        fn heap_bytes(&self) -> usize {
+            0
+        }
     }
     let loader = TestLanguageLoader::new();
     let lang = loader.get("rust");
@@ -864,9 +867,9 @@ fn cached_queries_only_project_changed_subtrees_and_reset_after_gaps() {
     let mut syntax = Syntax::new(text.into(), lang, PARSE_TIMEOUT, &loader).unwrap();
     let mut cache = crate::subtree_query::SubtreeQueryCache::default();
     let calls = std::cell::Cell::new(0);
-    let mut project = |mat: tree_sitter::QueryMatch<'_, '_>, idx| {
+    let mut project = |mat: tree_sitter::QueryMatch<'_, '_>, idx, _| {
         calls.set(calls.get() + 1);
-        Some(Event(mat.matched_node(idx).node.byte_range()))
+        Ok(Some(Event(mat.matched_node(idx).node.byte_range())))
     };
     let ranges = syntax.layer(syntax.root()).ranges.clone();
     assert_eq!(
@@ -878,6 +881,7 @@ fn cached_queries_only_project_changed_subtrees_and_reset_after_gaps() {
                 &[],
                 &ranges,
                 1,
+                &mut crate::subtree_query::Budget::default(),
                 &mut project
             )
             .unwrap()
@@ -900,6 +904,7 @@ fn cached_queries_only_project_changed_subtrees_and_reset_after_gaps() {
                 &[edit],
                 &ranges,
                 2,
+                &mut crate::subtree_query::Budget::default(),
                 &mut project
             )
             .unwrap()
@@ -916,6 +921,7 @@ fn cached_queries_only_project_changed_subtrees_and_reset_after_gaps() {
             &[],
             &ranges,
             4,
+            &mut crate::subtree_query::Budget::default(),
             &mut project,
         )
         .unwrap();
@@ -934,6 +940,7 @@ fn cached_queries_only_project_changed_subtrees_and_reset_after_gaps() {
             &[],
             &ranges,
             5,
+            &mut crate::subtree_query::Budget::default(),
             &mut project
         )
         .unwrap()
@@ -994,6 +1001,9 @@ fn nonmatching_top_level_children_do_not_grow_the_cache_without_bound() {
         fn cacheable(&self) -> bool {
             true
         }
+        fn heap_bytes(&self) -> usize {
+            0
+        }
     }
     let loader = TestLanguageLoader::new();
     let lang = loader.get("rust");
@@ -1015,9 +1025,10 @@ fn nonmatching_top_level_children_do_not_grow_the_cache_without_bound() {
             &[],
             &[],
             1,
-            |_, _| {
+            &mut crate::subtree_query::Budget::default(),
+            |_, _, _| {
                 calls.set(calls.get() + 1);
-                Some(Probe)
+                Ok(Some(Probe))
             }
         )
         .is_none());
@@ -1025,7 +1036,7 @@ fn nonmatching_top_level_children_do_not_grow_the_cache_without_bound() {
 }
 
 #[test]
-fn cache_fallback_preserves_multiple_content_captures_and_predicate_changes() {
+fn cache_fallback_preserves_multiple_content_captures() {
     let mut loader = TestLanguageLoader::new();
     loader.overwrite_injections("rust",r#"
 ((source_file (function_item body: (block) @injection.content) (function_item body: (block) @injection.content))
@@ -1046,4 +1057,124 @@ fn cache_fallback_preserves_multiple_content_captures_and_predicate_changes() {
         syntax_observation(&syntax, &after, &loader),
         syntax_observation(&full, &after, &loader)
     );
+}
+
+#[test]
+fn cached_queries_match_full_queries_in_python_html_and_markdown() {
+    let loader = TestLanguageLoader::new();
+    struct Case {
+        language: &'static str,
+        source: &'static str,
+        edits: &'static [(&'static str, &'static str)],
+    }
+    let cases = [
+        Case { language: "python", source: "# TODO one\ndef first(value):\n    local = \"é\"\n    return value\n\n# TODO two\ndef second():\n    return 2\n", edits: &[
+            ("TODO one", "FIXME 😀"), ("local", "renamed"), ("é", "日本語"),
+            ("# TODO two\n", ""), ("def first", "# prefix\ndef first"),
+        ]},
+        Case { language: "html", source: "<style>p { color: red; }</style>\n<!-- TODO -->\n<div>é</div>\n<style>span { color: green; }</style>", edits: &[
+            ("red", "blue"), ("TODO", "FIXME 😀"), ("é", "日本語"),
+            ("<!-- FIXME 😀 -->", ""), ("<style>", "<div>"), ("</style>", "</div>"),
+        ]},
+        Case { language: "markdown", source: "# Title\n\n```rust\nfn sample() { let x = \"é\"; }\n```\n\nText *one*.\n\n```python\ndef other(): return 1\n```\n\n<div>HTML</div>\n", edits: &[
+            ("rust", "python"), ("sample", "renamed"), ("é", "日本語"),
+            ("*one*", "**two**"), ("HTML", "<b>HTML</b>"), ("}\n```", "}\n``"),
+        ]},
+    ];
+    for Case {
+        language: name,
+        source: initial,
+        edits,
+    } in cases
+    {
+        let lang = loader.get(name);
+        let mut text = initial.to_owned();
+        let mut syntax = Syntax::new(text.as_str().into(), lang, PARSE_TIMEOUT, &loader).unwrap();
+        assert!(syntax.layers.len() > 1, "{name} must exercise injections");
+        for &(before, inserted) in edits {
+            let mut snapshot = syntax.clone();
+            assert_eq!(
+                syntax_observation(&snapshot, &text, &loader),
+                syntax_observation(&syntax, &text, &loader)
+            );
+            let start = text.find(before).unwrap();
+            let (after, edit) = edit_text(&text, start, start + before.len(), inserted);
+            for target in [&mut syntax, &mut snapshot] {
+                target
+                    .update(after.as_str().into(), PARSE_TIMEOUT, &[edit], &loader)
+                    .unwrap();
+            }
+            let full = crate::subtree_query::with_full_queries(|| {
+                Syntax::new(after.as_str().into(), lang, PARSE_TIMEOUT, &loader).unwrap()
+            });
+            let expected = syntax_observation(&full, &after, &loader);
+            assert_eq!(
+                syntax_observation(&syntax, &after, &loader),
+                expected,
+                "{name}: {before:?}"
+            );
+            assert_eq!(
+                syntax_observation(&snapshot, &after, &loader),
+                expected,
+                "{name} snapshot: {before:?}"
+            );
+            text = after;
+        }
+    }
+}
+
+#[test]
+fn subtree_eligibility_rejects_root_context_constraints() {
+    use tree_sitter::Query;
+    let loader = TestLanguageLoader::new();
+    let grammar = loader.get_config(loader.get("rust")).unwrap().grammar;
+    for source in [
+        "name: (identifier) @name",
+        "((identifier) @a . (identifier) @b)",
+        "(_expression/identifier) @name",
+    ] {
+        let query = Query::new(grammar, source, |_, _| Ok(())).unwrap();
+        assert!(!query.can_partition_subtrees(), "{source}");
+    }
+    for source in [
+        "(identifier) @name",
+        "(function_item name: (identifier) @name)",
+        "(function_item !type_parameters) @function",
+        "(block . (expression_statement) @statement .)",
+    ] {
+        let query = Query::new(grammar, source, |_, _| Ok(())).unwrap();
+        assert!(query.can_partition_subtrees(), "{source}");
+    }
+}
+
+#[test]
+fn same_shape_text_edits_invalidate_injection_predicates() {
+    let mut loader = TestLanguageLoader::new();
+    loader.overwrite_injections(
+        "rust",
+        r#"
+((function_item name: (identifier) @_name body: (block) @injection.content)
+ (#eq? @_name "first") (#set! injection.language "comment")
+ (#set! injection.include-children))
+"#
+        .into(),
+    );
+    let lang = loader.get("rust");
+    let mut text = "fn first() { /* TODO */ }\nfn other() { /* FIXME */ }".to_owned();
+    let mut syntax = Syntax::new(text.as_str().into(), lang, PARSE_TIMEOUT, &loader).unwrap();
+    for (needle, inserted) in [("first", "third"), ("third", "first"), ("other", "first")] {
+        let start = text.find(needle).unwrap();
+        let (after, edit) = edit_text(&text, start, start + needle.len(), inserted);
+        syntax
+            .update(after.as_str().into(), PARSE_TIMEOUT, &[edit], &loader)
+            .unwrap();
+        let full = crate::subtree_query::with_full_queries(|| {
+            Syntax::new(after.as_str().into(), lang, PARSE_TIMEOUT, &loader).unwrap()
+        });
+        assert_eq!(
+            syntax_observation(&syntax, &after, &loader),
+            syntax_observation(&full, &after, &loader)
+        );
+        text = after;
+    }
 }

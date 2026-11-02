@@ -20,8 +20,15 @@ injection reconciliation still run in full.
 
 Queries that depend on parent or sibling context use the original full query.
 So do root captures, multiple injection-content captures and cases that exceed
-the cache limits: 4,096 children and 65,536 events per layer/query. Query changes,
-changed included ranges and skipped updates invalidate cached results.
+4,096 children or 65,536 events per layer/query. All query caches in one syntax
+document share a 2 MiB budget for owned buffers, including nested exclusion
+arrays. Native trees, allocator overhead and temporary query results are outside
+that budget. Exceeding a limit releases that query's cache and runs the full query.
+
+Query changes, changed included ranges and skipped updates invalidate cached
+results. Cloning syntax preserves its semantic state and starts with empty caches.
+Interrupted updates release all query caches.
 
 The cache checks compiled Tree-sitter steps through `bindings/src/extended.c`.
-Review that helper when updating the vendored library.
+The build requires an explicit review of that helper when changing the vendored
+Tree-sitter revision.

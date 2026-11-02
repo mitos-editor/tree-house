@@ -100,6 +100,9 @@ impl crate::subtree_query::Event for InjectionEvent {
                 Marker::Match(r) | Marker::Filename(r) | Marker::Shebang(r) => !r.is_empty(),
             })
     }
+    fn heap_bytes(&self) -> usize {
+        self.excluded.capacity() * std::mem::size_of::<Range>()
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -254,24 +257,55 @@ impl InjectionsQuery {
             }
         }
         let node = &query_match.matched_node(node_idx).node;
-        let event = InjectionEvent {
-            pattern: query_match.pattern(),
-            id: (0, query_match.id()),
-            marker,
-            range: node.byte_range(),
-            excluded: node
-                .children()
+        let mut excluded = Vec::with_capacity(if include == IncludedChildren::All {
+            0
+        } else {
+            node.child_count() as usize
+        });
+        excluded.extend(
+            node.children()
                 .filter(|node| match include {
                     IncludedChildren::None => true,
                     IncludedChildren::All => false,
                     IncludedChildren::Unnamed => node.is_named(),
                 })
-                .map(|n| n.byte_range())
-                .collect(),
+                .map(|n| n.byte_range()),
+        );
+        let event = InjectionEvent {
+            pattern: query_match.pattern(),
+            id: (0, query_match.id()),
+            marker,
+            range: node.byte_range(),
+            excluded,
             multiple_content: count != 1,
             last_content: last == node_idx,
         };
         Some(event)
+    }
+
+    fn project_cached_match(
+        &self,
+        mat: &QueryMatch<'_, '_>,
+        idx: MatchedNodeIdx,
+        heap_budget: usize,
+    ) -> Result<Option<InjectionEvent>, ()> {
+        let node = mat.matched_node(idx);
+        if Some(node.capture) != self.injection_content_capture {
+            return Ok(None);
+        }
+        let include = self
+            .injection_properties
+            .get(&mat.pattern())
+            .map(|p| p.include_children)
+            .unwrap_or_default();
+        // Bound the exclusion buffer before allocating it. Counting all children
+        // also covers spare capacity when only named children are excluded.
+        if include != IncludedChildren::All
+            && node.node.child_count() as usize > heap_budget / std::mem::size_of::<Range>()
+        {
+            return Err(());
+        }
+        Ok(self.project_match(mat, idx))
     }
 
     // Resolve markers with the current source and loader, even for cached captures.
@@ -356,6 +390,7 @@ impl InjectionsQuery {
         edits: &[tree_sitter::InputEdit],
         ranges: &[tree_sitter::Range],
         generation: u64,
+        budget: &mut crate::subtree_query::Budget,
     ) -> impl Iterator<Item = InjectionQueryMatch> + 'a {
         let events = cache.collect(
             &self.injection_query,
@@ -364,13 +399,14 @@ impl InjectionsQuery {
             edits,
             ranges,
             generation,
-            |mat, idx| {
-                let event = self.project_match(&mat, idx);
+            budget,
+            |mat, idx, heap_budget| {
+                let event = self.project_cached_match(&mat, idx, heap_budget)?;
                 if event.as_ref().is_some_and(|e| e.last_content) {
                     // Release native capture storage after the final content capture.
                     mat.remove();
                 }
-                event
+                Ok(event)
             },
         );
         let mut cursor = events.is_none().then(|| {
@@ -452,12 +488,14 @@ impl InjectionsQuery {
 }
 
 impl Syntax {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_injection_query(
         &mut self,
         layer: Layer,
         edits: &[tree_sitter::InputEdit],
         source: RopeSlice<'_>,
         loader: &impl LanguageLoader,
+        budget: &mut crate::subtree_query::Budget,
         mut parse_layer: impl FnMut(Layer),
     ) {
         let generation = self.query_generation;
@@ -468,9 +506,11 @@ impl Syntax {
             ..
         }) = loader.get_config(layer_data.language)
         else {
+            layer_data.injection_cache = Default::default();
             return;
         };
         if injections_query.injection_content_capture.is_none() {
+            layer_data.injection_cache = Default::default();
             return;
         }
 
@@ -488,6 +528,7 @@ impl Syntax {
             edits,
             &parent_ranges,
             generation,
+            budget,
         );
 
         let mut combined_injections: HashMap<InjectionScope, Layer> = HashMap::with_capacity(32);
@@ -887,6 +928,40 @@ fn ranges_intersect(a: &Range, b: &Range) -> bool {
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "fixtures")]
+    #[test]
+    fn cached_exclusions_check_the_budget_before_projection() {
+        use crate::tests::TestLanguageLoader;
+        let loader = TestLanguageLoader::new();
+        let lang = loader.get("rust");
+        let grammar = loader.get_config(lang).unwrap().grammar;
+        let query = InjectionsQuery::new(grammar, "((function_item body: (block) @injection.content) (#set! injection.language \"comment\"))", "").unwrap();
+        let text = "fn example() { let value = 1; }";
+        let syntax = Syntax::new(
+            text.into(),
+            lang,
+            std::time::Duration::from_secs(1),
+            &loader,
+        )
+        .unwrap();
+        let mut cursor = InactiveQueryCursor::default().execute_query(
+            &query.injection_query,
+            &syntax.tree().root_node(),
+            ropey::RopeSlice::from(text),
+        );
+        let (mat, idx) = cursor.next_matched_node().unwrap();
+        assert!(query.project_cached_match(&mat, idx, 0).is_err());
+        let full = query.project_match(&mat, idx).unwrap();
+        assert!(!full.excluded.is_empty());
+        let bytes = full.excluded.capacity() * std::mem::size_of::<Range>();
+        assert_eq!(crate::subtree_query::Event::heap_bytes(&full), bytes);
+        let cached = query
+            .project_cached_match(&mat, idx, bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.excluded, full.excluded);
+    }
 
     #[test]
     fn exclude_ranges_no_exclusions() {

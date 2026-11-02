@@ -181,6 +181,9 @@ impl crate::subtree_query::Event for LocalEvent {
     fn cacheable(&self) -> bool {
         !self.range.is_empty()
     }
+    fn heap_bytes(&self) -> usize {
+        0
+    }
 }
 
 impl Syntax {
@@ -190,6 +193,7 @@ impl Syntax {
         source: RopeSlice<'_>,
         loader: &impl LanguageLoader,
         edits: &[tree_sitter::InputEdit],
+        budget: &mut crate::subtree_query::Budget,
     ) {
         let generation = self.query_generation;
         let layer_data = &mut self.layer_mut(layer);
@@ -198,6 +202,7 @@ impl Syntax {
             ..
         }) = loader.get_config(layer_data.language)
         else {
+            layer_data.local_cache = Default::default();
             return;
         };
         let definition_captures = injection_query.local_definition_captures.load();
@@ -213,13 +218,14 @@ impl Syntax {
             edits,
             &layer_data.ranges,
             generation,
-            |query_match, node_idx| {
+            budget,
+            |query_match, node_idx, _| {
                 let node = query_match.matched_node(node_idx);
-                Some(LocalEvent {
+                Ok(Some(LocalEvent {
                     capture: node.capture,
                     pattern: query_match.pattern(),
                     range: node.node.byte_range(),
-                })
+                }))
             },
         );
         let mut cursor = events.is_none().then(|| {
