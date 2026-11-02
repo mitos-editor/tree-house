@@ -10,52 +10,48 @@ Documentation is a work-in-progress and these crates may see breaking changes as
 * `highlighter/` contains the `tree-house` crate which exposes a robust highlighter and query iterator for working across [injections].
 * `skidder/` contains the `skidder` crate which exposes utilities for building a package repository for tree-sitter grammars.
 * `cli/` contains the `skidder-cli` crate which wraps `skidder` in a command line interface.
-### Necessary-byte prefilter for injection queries
+### Predicate-derived query prefilters
 
-Injection patterns can declare `(#set! injection.required-byte "/")`. This is
-an assertion by the query author: **every match must contain that ASCII byte
-within its matched subtree**. It is an optimization hint, not an extra predicate.
-Slash-delimited comments can require `/`, Python comments can require `#`, and
-HTML comment/script/style patterns can require `<`. No language names or node
-kinds are special-cased in the highlighter.
-
-For example, these two Python injection patterns have different necessary bytes:
+The query engine derives necessary literals from ordinary positive text
+predicates: `#eq?`, `#any-of?`, `#match?` and their existential `#any-*` forms.
+No custom optimization properties or language-specific Rust code are needed.
+For example, a query for slash-prefixed comments can use a normal predicate:
 
 ```scheme
 ((comment) @injection.content
- (#set! injection.required-byte "#")
+ (#match? @injection.content "^/")
  (#set! injection.language "comment"))
-
-((string (string_content) @injection.content)
- (#match? @injection.content "^fn ")
- (#set! injection.required-byte "f")
- (#set! injection.language "rust"))
 ```
 
-A query is an alternative between patterns. Its compiled, immutable prefilter
-therefore permits execution when **any** pattern's required byte is present.
-It rejects execution only if **all** alternatives are impossible. One unannotated
-pattern disables rejection for the whole query. Empty queries also retain the
-normal path. When a marker is present, the original query runs with all its
-patterns, predicates, precedence and combined-injection behavior intact.
+This predicate retains its ordinary meaning. The compiler can additionally prove
+that a match requires `/`, and query cursors can reject a slash-free subtree
+before walking its nodes. A present literal only permits normal execution;
+all predicates, capture ordering and query semantics are still checked.
 
-Compilation deduplicates markers into a fixed-size ASCII set. A single marker
-uses the optimized single-byte scan; multiple markers share one pass. Scanning
-uses rope chunks within the queried subtree's byte span, without flattening the
-source or repeatedly scanning unrelated parts of a containing document. Gaps
-between combined injection ranges are included conservatively. A rejected query
-still goes through normal reconciliation to remove obsolete injection layers.
+Each pattern contributes a necessary condition from a positive predicate.
+Patterns are alternatives, so a whole query can be rejected only when all of
+its alternatives are impossible. One pattern without a sound, nonempty literal
+requirement disables rejection for the query. Negated predicates and
+capture-to-capture comparisons supply no literal requirement. Predicates over
+all captures require a nonoptional capture; existential predicates already
+require at least one capture. Tree-sitter's public capture-quantifier API
+provides this distinction.
 
-The value must be exactly one ASCII byte. Repeating the same value is allowed;
-conflicting values on one pattern are rejected. If no necessary byte can be
-proved for every match of a pattern, leave it unannotated. An incorrect hint can
-hide valid injections, so new annotations need comparisons against the original
-query through edits, false-positive markers and nested languages. The test suite
-checks complete highlight events and injection ranges for Python, HTML/CSS and
-Rust, as well as rope chunk boundaries, Unicode and unannotated alternatives.
+Regex predicates are parsed once. Their HIR builds the ordinary matcher and
+feeds `regex-syntax`'s conservative literal extractor. Anchors, boundaries,
+Unicode case folding, alternatives and empty matches are handled by that
+library, not by inspecting regex strings. Extraction is bounded to 64 literals
+of at most 64 bytes each, with at most 4 KiB of literal payload. Unsupported,
+empty, over-budget or truncated UTF-8 requirements retain full execution.
 
-The highlighter owns prefilter compilation and execution; language packages own
-the assertions in their query files. The mechanism does not infer lexical rules
-from node names or mutate shared query patterns. Automatic inference would need
-a separate soundness model for optional captures, negated predicates and regex
-anchors; it is not part of this contract.
+Compiled plans are immutable. Single-byte requirements use a direct chunk scan;
+other literal sets use the existing cursor-based regex engine, including
+matches spanning chunks. Scans cover the queried node's entire byte span,
+not just the cursor's narrower capture range, and never flatten the source.
+Disabling captures discards the plan because it can make an all-captures
+predicate vacuously true. Removing patterns leaves its conservative proof valid.
+
+This optimization belongs to the generic query engine and is independent of
+injection discovery and incremental query-result caching. Language packages
+continue to own ordinary query semantics. An opaque node name such as
+`comment` does not by itself prove a particular delimiter.

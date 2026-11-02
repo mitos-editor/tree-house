@@ -19,9 +19,6 @@ use tree_sitter::{
     Capture, Grammar, InactiveQueryCursor, MatchedNodeIdx, Node, Pattern, Query, QueryMatch,
 };
 
-mod prefilter;
-use prefilter::{Prefilter, RequiredByte};
-
 const SHEBANG: &str = r"#!\s*(?:\S*[/\\](?:env\s+(?:\-\S+\s+)*)?)?([^\s\.\d]+)";
 static SHEBANG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(SHEBANG).unwrap());
 
@@ -30,7 +27,6 @@ pub struct InjectionProperties {
     include_children: IncludedChildren,
     language: Option<Box<str>>,
     combined: bool,
-    required_byte: Option<RequiredByte>,
 }
 
 /// An indicator in the document or query source file which used by the loader to know which
@@ -89,7 +85,6 @@ enum IncludedChildren {
 pub struct InjectionsQuery {
     injection_query: Query,
     injection_properties: HashMap<Pattern, InjectionProperties>,
-    prefilter: Prefilter,
     injection_content_capture: Option<Capture>,
     injection_language_capture: Option<Capture>,
     injection_filename_capture: Option<Capture>,
@@ -139,33 +134,12 @@ impl InjectionsQuery {
                     key: "injection.combined",
                     val: None,
                 } => injection_properties.entry(pattern).or_default().combined = true,
-                UserPredicate::SetProperty {
-                    key: "injection.required-byte",
-                    val,
-                } => {
-                    let byte = RequiredByte::parse(val)?;
-                    let properties = injection_properties.entry(pattern).or_default();
-                    if properties
-                        .required_byte
-                        .is_some_and(|previous| previous != byte)
-                    {
-                        return Err(InvalidPredicateError::Other {
-                            msg: "conflicting injection.required-byte properties".into(),
-                        });
-                    }
-                    properties.required_byte = Some(byte);
-                }
                 predicate => {
                     return Err(InvalidPredicateError::unknown(predicate));
                 }
             }
             Ok(())
         })?;
-        let prefilter = Prefilter::compile(injection_query.patterns().map(|pattern| {
-            injection_properties
-                .get(&pattern)
-                .and_then(|properties| properties.required_byte)
-        }));
         let mut local_query = Query::new(grammar, local_query_text, |pattern, predicate| {
             match predicate {
                 UserPredicate::SetProperty {
@@ -189,7 +163,6 @@ impl InjectionsQuery {
 
         Ok(InjectionsQuery {
             injection_properties,
-            prefilter,
             injection_content_capture: injection_query.get_capture("injection.content"),
             injection_language_capture: injection_query.get_capture("injection.language"),
             injection_filename_capture: injection_query.get_capture("injection.filename"),
@@ -313,18 +286,11 @@ impl InjectionsQuery {
         source: RopeSlice<'a>,
         loader: &'a impl LanguageLoader,
     ) -> impl Iterator<Item = InjectionQueryMatch<'a>> + 'a {
-        // Keep the normal reconciliation path even when no pattern can match.
-        let absent = !self.prefilter.may_match(source, node.byte_range());
-        let mut cursor = (!absent).then(|| {
-            InactiveQueryCursor::new(0..u32::MAX, TREE_SITTER_MATCH_LIMIT).execute_query(
-                &self.injection_query,
-                node,
-                source,
-            )
-        });
+        let mut cursor = InactiveQueryCursor::new(0..u32::MAX, TREE_SITTER_MATCH_LIMIT)
+            .execute_query(&self.injection_query, node, source);
         let injection_content_capture = self.injection_content_capture.unwrap();
         let iter = iter::from_fn(move || loop {
-            let (query_match, node_idx) = cursor.as_mut()?.next_matched_node()?;
+            let (query_match, node_idx) = cursor.next_matched_node()?;
             if query_match.matched_node(node_idx).capture != injection_content_capture {
                 continue;
             }

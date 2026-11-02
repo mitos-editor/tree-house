@@ -19,14 +19,14 @@ use crate::{Language, Layer, Syntax};
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[test]
-fn required_byte_prefilter_preserves_injections_across_edits() {
+fn predicate_prefilter_preserves_injections_across_edits() {
     let plain = r#"
 ((line_comment) @injection.content (#set! injection.language "comment") (#set! injection.include-children))
 ((block_comment) @injection.content (#set! injection.language "comment") (#set! injection.include-children))
 "#;
     let required = plain.replace(
         "(#set! injection.language",
-        "(#set! injection.required-byte \"/\") (#set! injection.language",
+        "(#match? @injection.content \"^/\") (#set! injection.language",
     );
     let mut reference_loader = TestLanguageLoader::new();
     reference_loader.overwrite_injections("rust", plain.into());
@@ -85,10 +85,10 @@ fn required_byte_prefilter_preserves_injections_across_edits() {
 }
 
 #[test]
-fn required_byte_prefilter_preserves_unannotated_and_mixed_patterns() {
+fn predicate_prefilter_preserves_unannotated_and_mixed_patterns() {
     let comment = r#"((line_comment) @injection.content
-        (#set! injection.language "comment") (#set! injection.include-children) (#set! injection.required-byte "/"))"#;
-    for property in ["", "(#set! injection.required-byte \"#\")"] {
+        (#set! injection.language "comment") (#set! injection.include-children) (#match? @injection.content "^/"))"#;
+    for property in ["", "(#match? @injection.content \"#\")"] {
         let query = format!("{comment}\n((string_literal) @injection.content (#set! injection.language \"comment\") (#set! injection.include-children) {property})");
         let mut loader = TestLanguageLoader::new();
         loader.overwrite_injections("rust", query);
@@ -103,29 +103,20 @@ fn required_byte_prefilter_preserves_unannotated_and_mixed_patterns() {
 }
 
 #[test]
-fn required_byte_metadata_rejects_invalid_and_conflicting_values() {
+fn custom_required_byte_hint_is_not_supported() {
     let grammar = get_grammar("rust", &Overwrites::default()).grammar;
-    for property in [
-        "(#set! injection.required-byte)",
-        "(#set! injection.required-byte \"\")",
-        "(#set! injection.required-byte \"//\")",
-        "(#set! injection.required-byte \"é\")",
-        "(#set! injection.required-byte \"/\") (#set! injection.required-byte \"#\")",
-    ] {
-        let query = format!(
-            "((line_comment) @injection.content (#set! injection.language \"comment\") (#set! injection.include-children) {property})"
-        );
-        assert!(crate::injections_query::InjectionsQuery::new(grammar, &query, "").is_err());
-    }
+    let query = r#"((line_comment) @injection.content
+        (#set! injection.language "comment") (#set! injection.required-byte "/"))"#;
+    assert!(crate::injections_query::InjectionsQuery::new(grammar, query, "").is_err());
 }
 
 #[test]
-fn required_byte_scan_covers_rope_chunks_and_nonzero_slices() {
+fn predicate_prefilter_scan_covers_rope_chunks_and_nonzero_slices() {
     let mut loader = TestLanguageLoader::new();
     loader.overwrite_injections(
         "rust",
         r#"((line_comment) @injection.content
-        (#set! injection.language "comment") (#set! injection.include-children) (#set! injection.required-byte "/"))"#
+        (#set! injection.language "comment") (#set! injection.include-children) (#match? @injection.content "^/"))"#
             .into(),
     );
     let prefix = "fn ignored() {}\n".repeat(100);
@@ -141,7 +132,7 @@ fn required_byte_scan_covers_rope_chunks_and_nonzero_slices() {
 }
 
 #[test]
-fn required_byte_prefilter_matches_full_queries_in_python_html_and_rust() {
+fn predicate_prefilter_matches_full_queries_in_python_html_and_rust() {
     let python = r#"
 ((comment) @injection.content
  (#set! injection.language "comment") (#set! injection.include-children))
@@ -152,7 +143,7 @@ fn required_byte_prefilter_matches_full_queries_in_python_html_and_rust() {
     let html = r#"
 ((comment) @injection.content
  (#set! injection.language "comment") (#set! injection.include-children))
-((style_element (raw_text) @injection.content)
+((style_element (raw_text) @injection.content) @_element
  (#set! injection.language "css") (#set! injection.include-children))
 "#;
     let rust = r#"
@@ -165,15 +156,10 @@ fn required_byte_prefilter_matches_full_queries_in_python_html_and_rust() {
         (
             "python",
             python,
-            python
-                .replace(
-                    "(#set! injection.language \"comment\")",
-                    "(#set! injection.required-byte \"#\") (#set! injection.language \"comment\")",
-                )
-                .replace(
-                    "(#set! injection.language \"rust\")",
-                    "(#set! injection.required-byte \"f\") (#set! injection.language \"rust\")",
-                ),
+            python.replace(
+                "(#set! injection.language \"comment\")",
+                "(#match? @injection.content \"^#\") (#set! injection.language \"comment\")",
+            ),
             &[
                 "value = 1\n",
                 "# todo café\nvalue = 1\n",
@@ -187,8 +173,12 @@ fn required_byte_prefilter_matches_full_queries_in_python_html_and_rust() {
             "html",
             html,
             html.replace(
-                "(#set! injection.language",
-                "(#set! injection.required-byte \"<\") (#set! injection.language",
+                "(#set! injection.language \"comment\")",
+                "(#match? @injection.content \"^<\") (#set! injection.language \"comment\")",
+            )
+            .replace(
+                "(#set! injection.language \"css\")",
+                "(#match? @_element \"^<\") (#set! injection.language \"css\")",
             ),
             &[
                 "plain é日 text",
@@ -205,7 +195,7 @@ fn required_byte_prefilter_matches_full_queries_in_python_html_and_rust() {
             rust,
             rust.replace(
                 "(#set! injection.language",
-                "(#set! injection.required-byte \"/\") (#set! injection.language",
+                "(#match? @injection.content \"^/\") (#set! injection.language",
             ),
             &[
                 "fn main() {}",
@@ -227,7 +217,7 @@ fn required_byte_prefilter_matches_full_queries_in_python_html_and_rust() {
             "css",
             css.replace(
                 "(#set! injection.language",
-                "(#set! injection.required-byte \"/\") (#set! injection.language",
+                "(#match? @injection.content \"^/\") (#set! injection.language",
             ),
         );
         let mut previous = sources[0];
@@ -322,6 +312,271 @@ fn prefilter_observation(
         .collect::<Vec<_>>();
     layers.sort();
     (highlights, layers)
+}
+
+#[test]
+fn predicate_prefilter_rejects_before_visiting_each_identifier() {
+    use std::cell::Cell;
+    use tree_sitter::{Input, RopeInput};
+    struct Counted<'a> {
+        inner: RopeInput<'a>,
+        seeks: &'a Cell<usize>,
+    }
+    impl<'a> Input for Counted<'a> {
+        type Cursor = <RopeInput<'a> as Input>::Cursor;
+        fn cursor_at(&mut self, offset: u32) -> &mut Self::Cursor {
+            self.seeks.set(self.seeks.get() + 1);
+            self.inner.cursor_at(offset)
+        }
+        fn eq(&mut self, a: std::ops::Range<u32>, b: std::ops::Range<u32>) -> bool {
+            self.inner.eq(a, b)
+        }
+    }
+    let loader = TestLanguageLoader::new();
+    let source = ropey::Rope::from_str(&"fn actual() {}\n".repeat(128));
+    let syntax = Syntax::new(source.slice(..), loader.get("rust"), PARSE_TIMEOUT, &loader).unwrap();
+    let tree = syntax.layer(syntax.root).parse_tree.as_ref().unwrap();
+    let grammar = loader.get_config(loader.get("rust")).unwrap().grammar;
+    let query = tree_sitter::Query::new(
+        grammar,
+        r#"((identifier) @name (#eq? @name "needle"))"#,
+        |_, predicate| {
+            Err(tree_sitter::query::InvalidPredicateError::unknown(
+                predicate,
+            ))
+        },
+    )
+    .unwrap();
+    let seeks = Cell::new(0);
+    let mut cursor =
+        tree_sitter::InactiveQueryCursor::new(0..u32::MAX, crate::TREE_SITTER_MATCH_LIMIT)
+            .execute_query(
+                &query,
+                &tree.root_node(),
+                Counted {
+                    inner: RopeInput::new(source.slice(..)),
+                    seeks: &seeks,
+                },
+            );
+    assert!(cursor.next_match().is_none());
+    assert_eq!(
+        seeks.get(),
+        1,
+        "one source prefilter scan should replace per-identifier predicate reads"
+    );
+}
+
+type PredicateMatch = (usize, Vec<(String, std::ops::Range<u32>)>);
+type PredicateCapture = (usize, String, std::ops::Range<u32>);
+
+fn predicate_observation(
+    grammar: Grammar,
+    node: &tree_sitter::Node<'_>,
+    source: ropey::RopeSlice<'_>,
+    text: &str,
+) -> (Vec<PredicateMatch>, Vec<PredicateCapture>) {
+    let query = tree_sitter::Query::new(grammar, text, |_, predicate| {
+        Err(tree_sitter::query::InvalidPredicateError::unknown(
+            predicate,
+        ))
+    })
+    .unwrap();
+    let mut cursor =
+        tree_sitter::InactiveQueryCursor::new(0..u32::MAX, crate::TREE_SITTER_MATCH_LIMIT)
+            .execute_query(&query, node, source);
+    let mut matches = Vec::new();
+    while let Some(mat) = cursor.next_match() {
+        matches.push((
+            mat.pattern().idx(),
+            mat.matched_nodes()
+                .map(|node| (node.capture.name(&query).into(), node.node.byte_range()))
+                .collect(),
+        ));
+    }
+    let mut cursor = cursor.reuse().execute_query(&query, node, source);
+    let mut captures = Vec::new();
+    while let Some((mat, index)) = cursor.next_matched_node() {
+        let node = mat.matched_node(index);
+        captures.push((
+            mat.pattern().idx(),
+            node.capture.name(&query).into(),
+            node.node.byte_range(),
+        ));
+    }
+    (matches, captures)
+}
+
+#[test]
+fn predicate_prefilter_agrees_with_full_queries_for_supported_and_unknown_constraints() {
+    let loader = TestLanguageLoader::new();
+    let grammar = loader.get_config(loader.get("rust")).unwrap().grammar;
+    let queries = [
+        r#"((identifier) @name (#eq? @name "needle"))"#,
+        r#"((identifier) @name (#any-eq? @name "needle"))"#,
+        r#"((identifier) @name (#any-of? @name "needle" "actual"))"#,
+        r#"((identifier) @name (#match? @name "^needle$"))"#,
+        r#"((identifier) @name (#any-match? @name "\\bneedle\\b"))"#,
+        r#"((identifier) @name (#match? @name "^(?:needle|other)$"))"#,
+        r#"((identifier) @name (#match? @name "(?i)^kelvin$"))"#,
+        r#"((identifier) @name (#match? @name "^(?:日本語|café)$"))"#,
+        r#"((identifier) @name (#match? @name "^[a-z]+$"))"#,
+        r#"((identifier) @name (#match? @name "^$"))"#,
+        r#"((identifier) @name (#match? @name "^(?:needle)?$"))"#,
+        r#"((identifier) @name (#not-match? @name "^needle$"))"#,
+        r#"((identifier) @name (#not-eq? @name "needle"))"#,
+        r#"((identifier) @name (#not-any-of? @name "needle" "actual"))"#,
+        r#"((identifier) @name (#any-of? @name "" "needle"))"#,
+        r#"((identifier) @name (#not-match? @name "^other$") (#match? @name "^needle$"))"#,
+        r#"((identifier) @name (#eq? @name "needle")) ((identifier) @name (#eq? @name "actual"))"#,
+        r#"((identifier) @name (#eq? @name "needle")) (integer_literal) @number"#,
+        r#"([(identifier) @name (integer_literal)] @value (#eq? @name "needle"))"#,
+        r#"([(identifier) @name (integer_literal)] @value (#any-eq? @name "needle"))"#,
+        r#"((function_item name: (identifier) @fn parameters: (parameters (parameter pattern: (identifier) @param)?)) (#match? @param "^needle$"))"#,
+        r#"((function_item name: (identifier) @fn parameters: (parameters (parameter pattern: (identifier) @param)*)) (#eq? @param "needle"))"#,
+        r#"((function_item name: (identifier) @fn parameters: (parameters (parameter pattern: (identifier) @param)+)) (#match? @param "^needle$"))"#,
+        r#"((function_item name: (identifier) @fn parameters: (parameters (parameter pattern: (identifier) @param)?)) (#any-match? @param "^needle$"))"#,
+        r#"((binary_expression left: (identifier) @a right: (identifier) @b) (#eq? @a @b))"#,
+    ];
+    for source in [
+        "fn actual() {}",
+        "fn needle() { let actual = 123; needle + needle; }",
+        "fn actual(value: i32) {} fn needle(needle: i32, needle: i32) {}",
+        "fn café() {} fn 日本語() {} fn KELVIN() {}",
+    ] {
+        let syntax = Syntax::new(
+            ropey::RopeSlice::from(source),
+            loader.get("rust"),
+            PARSE_TIMEOUT,
+            &loader,
+        )
+        .unwrap();
+        let node = syntax
+            .layer(syntax.root)
+            .parse_tree
+            .as_ref()
+            .unwrap()
+            .root_node();
+        for query in queries {
+            // This extra alternative always fails, but its negated predicate has
+            // no positive requirement. It forces ordinary full-query execution.
+            let full = format!("{query}\n((_) @_never (#not-match? @_never \"(?s)\"))");
+            assert_eq!(
+                predicate_observation(grammar, &node, ropey::RopeSlice::from(source), query),
+                predicate_observation(grammar, &node, ropey::RopeSlice::from(source), &full),
+                "{query}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn predicate_prefilter_handles_capture_disabling_cursor_reuse_and_ranges() {
+    let loader = TestLanguageLoader::new();
+    let grammar = loader.get_config(loader.get("rust")).unwrap().grammar;
+    let source = "fn actual() {}";
+    let syntax = Syntax::new(
+        ropey::RopeSlice::from(source),
+        loader.get("rust"),
+        PARSE_TIMEOUT,
+        &loader,
+    )
+    .unwrap();
+    let node = syntax
+        .layer(syntax.root)
+        .parse_tree
+        .as_ref()
+        .unwrap()
+        .root_node();
+    let make = |text| {
+        tree_sitter::Query::new(grammar, text, |_, p| {
+            Err(tree_sitter::query::InvalidPredicateError::unknown(p))
+        })
+        .unwrap()
+    };
+    let mut absent = make(r#"((identifier) @name (#eq? @name "needle"))"#);
+    let present = make(r#"((identifier) @name (#eq? @name "actual"))"#);
+    let mut cursor = tree_sitter::InactiveQueryCursor::default().execute_query(
+        &absent,
+        &node,
+        ropey::RopeSlice::from(source),
+    );
+    assert!(cursor.next_match().is_none());
+    let mut cursor = cursor
+        .reuse()
+        .execute_query(&present, &node, ropey::RopeSlice::from(source));
+    assert!(cursor.next_match().is_some());
+    let mut cursor = cursor
+        .reuse()
+        .execute_query(&absent, &node, ropey::RopeSlice::from(source));
+    assert!(cursor.next_matched_node().is_none());
+    drop(cursor);
+    absent.disable_capture("name");
+    let mut cursor = tree_sitter::InactiveQueryCursor::default().execute_query(
+        &absent,
+        &node,
+        ropey::RopeSlice::from(source),
+    );
+    assert!(
+        cursor.next_match().is_some(),
+        "a disabled capture makes #eq? vacuously true"
+    );
+    drop(cursor);
+
+    let source = "fn needle() { let actual = 1; }";
+    let syntax = Syntax::new(
+        ropey::RopeSlice::from(source),
+        loader.get("rust"),
+        PARSE_TIMEOUT,
+        &loader,
+    )
+    .unwrap();
+    let node = syntax
+        .layer(syntax.root)
+        .parse_tree
+        .as_ref()
+        .unwrap()
+        .root_node();
+    let query = make(
+        r#"((function_item name: (identifier) @name body: (block) @body) (#eq? @name "needle"))"#,
+    );
+    let body = source.find('{').unwrap() as u32;
+    let mut cursor = tree_sitter::InactiveQueryCursor::new(
+        body..source.len() as u32,
+        crate::TREE_SITTER_MATCH_LIMIT,
+    )
+    .execute_query(&query, &node, ropey::RopeSlice::from(source));
+    assert!(
+        cursor.next_matched_node().is_some(),
+        "requirements outside the capture range must remain visible"
+    );
+}
+
+#[test]
+fn predicate_prefilter_finds_literals_across_rope_chunks_and_nonzero_subtrees() {
+    let loader = TestLanguageLoader::new();
+    let grammar = loader.get_config(loader.get("rust")).unwrap().grammar;
+    let source = format!("{}\nfn needle() {{}}", "fn actual() {}\n".repeat(500));
+    let rope = ropey::Rope::from_str(&source);
+    let query = r#"((identifier) @name (#eq? @name "needle"))"#;
+    let syntax = Syntax::new(rope.slice(..), loader.get("rust"), PARSE_TIMEOUT, &loader).unwrap();
+    let node = syntax
+        .layer(syntax.root)
+        .parse_tree
+        .as_ref()
+        .unwrap()
+        .root_node();
+    assert_eq!(
+        predicate_observation(grammar, &node, rope.slice(..), query)
+            .0
+            .len(),
+        1
+    );
+    let first = node.children().next().unwrap();
+    assert!(
+        predicate_observation(grammar, &first, rope.slice(..), query)
+            .0
+            .is_empty()
+    );
 }
 
 static GRAMMARS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
