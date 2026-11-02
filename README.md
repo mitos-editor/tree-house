@@ -10,3 +10,28 @@ Documentation is a work-in-progress and these crates may see breaking changes as
 * `highlighter/` contains the `tree-house` crate which exposes a robust highlighter and query iterator for working across [injections].
 * `skidder/` contains the `skidder` crate which exposes utilities for building a package repository for tree-sitter grammars.
 * `cli/` contains the `skidder-cli` crate which wraps `skidder` in a command line interface.
+
+### Query prefilters
+
+The query engine can skip a subtree when its text lacks literals required by
+`#eq?`, `#any-of?` or `#match?`, including `#any-eq?` and `#any-match?`.
+For example:
+
+```scheme
+((comment) @injection.content
+ (#match? @injection.content "^/")
+ (#set! injection.language "comment"))
+```
+
+Without `/` in the subtree, this query cannot match. If `/` is present, the
+normal query and its predicates still run. The optimization needs no extra
+query properties and preserves match and capture results.
+
+A pattern without a safe text requirement keeps the whole query on the normal
+path. This includes optional captures that can let a predicate pass without
+reading text. Large or unsupported literal requirements also use normal
+execution. Regex literal extraction handles anchors, Unicode and alternatives;
+searches work across source chunks without copying the complete source.
+
+A node name such as `comment` does not imply a delimiter. Language packages
+remain responsible for their ordinary query semantics.

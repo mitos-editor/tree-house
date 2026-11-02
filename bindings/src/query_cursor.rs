@@ -25,10 +25,15 @@ pub struct QueryCursor<'a, 'tree, I: Input> {
     ptr: NonNull<QueryCursorData>,
     tree: PhantomData<&'tree Tree>,
     input: I,
+    // The compiled text requirements rule out every pattern for this source.
+    rejected: bool,
 }
 
 impl<'tree, I: Input> QueryCursor<'_, 'tree, I> {
     pub fn next_match(&mut self) -> Option<QueryMatch<'_, 'tree>> {
+        if self.rejected {
+            return None;
+        }
         let mut query_match = TSQueryMatch {
             id: 0,
             pattern_index: 0,
@@ -66,6 +71,9 @@ impl<'tree, I: Input> QueryCursor<'_, 'tree, I> {
     }
 
     pub fn next_matched_node(&mut self) -> Option<(QueryMatch<'_, 'tree>, MatchedNodeIdx)> {
+        if self.rejected {
+            return None;
+        }
         let mut query_match = TSQueryMatch {
             id: 0,
             pattern_index: 0,
@@ -183,14 +191,19 @@ impl InactiveQueryCursor {
         node: &Node<'tree>,
         input: I,
     ) -> QueryCursor<'a, 'tree, I::Input> {
+        let mut input = input.into_input();
+        let rejected = !query.could_match(&mut input, node);
         let ptr = self.ptr;
+        // Reset native state even after rejection, so pooled cursors and their
+        // match-limit status always belong to this execution.
         unsafe { ts_query_cursor_exec(ptr.as_ptr(), query.raw.as_ref(), node.as_raw()) };
         mem::forget(self);
         QueryCursor {
             query,
             ptr,
             tree: PhantomData,
-            input: input.into_input(),
+            input,
+            rejected,
         }
     }
 }

@@ -8,6 +8,7 @@ pub use crate::query::predicate::{InvalidPredicateError, Predicate};
 use crate::Grammar;
 
 mod predicate;
+mod prefilter;
 mod property;
 
 #[derive(Debug)]
@@ -68,12 +69,25 @@ pub struct Query {
     num_strings: u32,
     text_predicates: Vec<TextPredicate>,
     patterns: Box<[PatternData]>,
+    prefilter: Option<prefilter::Prefilter>,
 }
 
 unsafe impl Send for Query {}
 unsafe impl Sync for Query {}
 
 impl Query {
+    /// Check the complete node: predicate captures can lie outside the cursor
+    /// range used to select returned captures. A positive result is only a candidate.
+    pub(crate) fn could_match(
+        &self,
+        input: &mut impl crate::Input,
+        node: &crate::Node<'_>,
+    ) -> bool {
+        self.prefilter.as_ref().map_or(true, |prefilter| {
+            prefilter.may_match(input, node.byte_range())
+        })
+    }
+
     /// Create a new query from a string containing one or more S-expression
     /// patterns.
     ///
@@ -161,11 +175,17 @@ impl Query {
             num_strings,
             text_predicates: Vec::new(),
             patterns: Box::default(),
+            prefilter: None,
         };
+        let mut prefilter = prefilter::Builder::new();
         let patterns: Result<_, ParseError> = (0..num_patterns)
             .map(|pattern| {
                 query
-                    .parse_pattern_predicates(Pattern(pattern), &mut custom_predicate)
+                    .parse_pattern_predicates(
+                        Pattern(pattern),
+                        &mut custom_predicate,
+                        &mut prefilter,
+                    )
                     .map_err(|err| {
                         let pattern_start =
                             unsafe { ts_query_start_byte_for_pattern(query.raw, pattern) as usize };
@@ -212,6 +232,7 @@ impl Query {
             })
             .collect();
         query.patterns = patterns?;
+        query.prefilter = prefilter.finish();
         Ok(query)
     }
 
@@ -302,6 +323,9 @@ impl Query {
     /// any resource usage associated with recording the capture. Currently, there
     /// is no way to undo this.
     pub fn disable_capture(&mut self, name: &str) {
+        // An all-captures predicate may pass after its captures are removed,
+        // so its old literal requirement no longer applies.
+        self.prefilter = None;
         let bytes = name.as_bytes();
         unsafe {
             ts_query_disable_capture(self.raw, bytes.as_ptr(), bytes.len() as u32);
@@ -483,7 +507,36 @@ enum RawQueryError {
     Language = 6,
 }
 
+// Values match TSQuantifier in vendor/include/tree_sitter/api.h.
+#[repr(u32)]
+#[allow(dead_code)] // Constructed by the C API, not by Rust code.
+enum CaptureQuantifier {
+    Zero,
+    ZeroOrOne,
+    ZeroOrMore,
+    One,
+    OneOrMore,
+}
+
+impl Query {
+    // An all-captures predicate can pass with no captures. Only a capture
+    // that must appear supplies a necessary text requirement.
+    fn capture_required(&self, pattern: Pattern, capture: Capture) -> bool {
+        match unsafe { ts_query_capture_quantifier_for_id(self.raw, pattern.0, capture.0) } {
+            CaptureQuantifier::One | CaptureQuantifier::OneOrMore => true,
+            CaptureQuantifier::Zero
+            | CaptureQuantifier::ZeroOrOne
+            | CaptureQuantifier::ZeroOrMore => false,
+        }
+    }
+}
+
 extern "C" {
+    fn ts_query_capture_quantifier_for_id(
+        query: NonNull<QueryData>,
+        pattern: u32,
+        capture: u32,
+    ) -> CaptureQuantifier;
     /// Create a new query from a string containing one or more S-expression
     /// patterns. The query is associated with a particular language, and can
     /// only be run on syntax nodes parsed with that language. If all of the

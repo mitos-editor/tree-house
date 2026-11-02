@@ -4,6 +4,7 @@ use std::ops::Range;
 use std::ptr::NonNull;
 use std::{fmt, slice};
 
+use crate::query::prefilter;
 use crate::query::property::QueryProperty;
 use crate::query::{Capture, Pattern, PatternData, Query, QueryData, QueryStr, UserPredicate};
 use crate::query_cursor::MatchedNode;
@@ -137,7 +138,12 @@ impl Query {
         &mut self,
         pattern: Pattern,
         mut custom_predicate: impl FnMut(Pattern, UserPredicate) -> Result<(), InvalidPredicateError>,
+        prefilter: &mut prefilter::Builder,
     ) -> Result<PatternData, InvalidPredicateError> {
+        // Predicates in one pattern must all pass. A requirement from any one
+        // positive predicate is enough to rule out that pattern.
+        let mut required = None;
+        let derive = prefilter.enabled();
         let text_predicate_start = self.text_predicates.len() as u32;
 
         let predicate_steps = unsafe {
@@ -166,6 +172,15 @@ impl Query {
                         PredicateArg::Capture(capture) => TextPredicateKind::EqCapture(capture),
                         PredicateArg::String(str) => TextPredicateKind::EqString(str),
                     };
+                    if derive
+                        && required.is_none()
+                        && !negated
+                        && (!match_all || self.capture_required(pattern, capture_idx))
+                    {
+                        if let TextPredicateKind::EqString(value) = kind {
+                            required = prefilter::literals([self.get_string(value).as_bytes()]);
+                        }
+                    }
                     self.text_predicates.push(TextPredicate {
                         capture: capture_idx,
                         kind,
@@ -181,10 +196,22 @@ impl Query {
 
                     let negated = matches!(predicate.name(), "not-match?" | "any-not-match?");
                     let match_all = matches!(predicate.name(), "match?" | "not-match?");
-                    let regex = match Regex::builder().build(regex) {
+                    let hir = match regex_syntax::Parser::new().parse(regex) {
+                        Ok(hir) => hir,
+                        Err(err) => bail!("invalid regex '{regex}', {err}"),
+                    };
+                    let matcher = match Regex::builder().build_many_from_hir(&[&hir]) {
                         Ok(regex) => regex,
                         Err(err) => bail!("invalid regex '{regex}', {err}"),
                     };
+                    if derive
+                        && required.is_none()
+                        && !negated
+                        && (!match_all || self.capture_required(pattern, capture_idx))
+                    {
+                        required = prefilter::regex_literals(&hir);
+                    }
+                    let regex = matcher;
                     self.text_predicates.push(TextPredicate {
                         capture: capture_idx,
                         kind: TextPredicateKind::MatchString(regex),
@@ -222,9 +249,17 @@ impl Query {
                     let values: Result<_, InvalidPredicateError> = (1..predicate.num_args())
                         .map(|i| predicate.query_str_arg(i))
                         .collect();
+                    let values: Box<[_]> = values?;
+                    if derive && required.is_none() && !negated {
+                        required = prefilter::literals(
+                            values
+                                .iter()
+                                .map(|&value| self.get_string(value).as_bytes()),
+                        );
+                    }
                     self.text_predicates.push(TextPredicate {
                         capture,
-                        kind: TextPredicateKind::AnyString(values?),
+                        kind: TextPredicateKind::AnyString(values),
                         negated,
                         match_all: false,
                     });
@@ -236,6 +271,7 @@ impl Query {
                 _ => custom_predicate(pattern, UserPredicate::Other(predicate))?,
             }
         }
+        prefilter.pattern(required);
         Ok(PatternData {
             text_predicates: text_predicate_start..self.text_predicates.len() as u32,
         })
