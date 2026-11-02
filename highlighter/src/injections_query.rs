@@ -124,6 +124,16 @@ enum IncludedChildren {
     Unnamed,
 }
 
+impl IncludedChildren {
+    fn excluded_count(self, node: &tree_sitter::Node<'_>) -> usize {
+        match self {
+            Self::None => node.child_count() as usize,
+            Self::All => 0,
+            Self::Unnamed => node.named_child_count() as usize,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct InjectionsQuery {
     injection_query: Query,
@@ -257,11 +267,7 @@ impl InjectionsQuery {
             }
         }
         let node = &query_match.matched_node(node_idx).node;
-        let mut excluded = Vec::with_capacity(if include == IncludedChildren::All {
-            0
-        } else {
-            node.child_count() as usize
-        });
+        let mut excluded = Vec::with_capacity(include.excluded_count(node));
         excluded.extend(
             node.children()
                 .filter(|node| match include {
@@ -298,11 +304,8 @@ impl InjectionsQuery {
             .get(&mat.pattern())
             .map(|p| p.include_children)
             .unwrap_or_default();
-        // Bound the exclusion buffer before allocating it. Counting all children
-        // also covers spare capacity when only named children are excluded.
-        if include != IncludedChildren::All
-            && node.node.child_count() as usize > heap_budget / std::mem::size_of::<Range>()
-        {
+        // Bound the actual exclusion buffer before allocating it.
+        if include.excluded_count(&node.node) > heap_budget / std::mem::size_of::<Range>() {
             return Err(());
         }
         Ok(self.project_match(mat, idx))
@@ -936,7 +939,6 @@ mod tests {
         let loader = TestLanguageLoader::new();
         let lang = loader.get("rust");
         let grammar = loader.get_config(lang).unwrap().grammar;
-        let query = InjectionsQuery::new(grammar, "((function_item body: (block) @injection.content) (#set! injection.language \"comment\"))", "").unwrap();
         let text = "fn example() { let value = 1; }";
         let syntax = Syntax::new(
             text.into(),
@@ -945,22 +947,37 @@ mod tests {
             &loader,
         )
         .unwrap();
-        let mut cursor = InactiveQueryCursor::default().execute_query(
-            &query.injection_query,
-            &syntax.tree().root_node(),
-            ropey::RopeSlice::from(text),
-        );
-        let (mat, idx) = cursor.next_matched_node().unwrap();
-        assert!(query.project_cached_match(&mat, idx, 0).is_err());
-        let full = query.project_match(&mat, idx).unwrap();
-        assert!(!full.excluded.is_empty());
-        let bytes = full.excluded.capacity() * std::mem::size_of::<Range>();
-        assert_eq!(crate::subtree_query::Event::heap_bytes(&full), bytes);
-        let cached = query
-            .project_cached_match(&mat, idx, bytes)
-            .unwrap()
-            .unwrap();
-        assert_eq!(cached.excluded, full.excluded);
+        for (include, property) in [
+            (IncludedChildren::None, ""),
+            (IncludedChildren::All, "(#set! injection.include-children)"),
+            (
+                IncludedChildren::Unnamed,
+                "(#set! injection.include-unnamed-children)",
+            ),
+        ] {
+            let source = format!("((function_item body: (block) @injection.content) (#set! injection.language \"comment\") {property})");
+            let query = InjectionsQuery::new(grammar, &source, "").unwrap();
+            let mut cursor = InactiveQueryCursor::default().execute_query(
+                &query.injection_query,
+                &syntax.tree().root_node(),
+                ropey::RopeSlice::from(text),
+            );
+            let (mat, idx) = cursor.next_matched_node().unwrap();
+            let count = include.excluded_count(&mat.matched_node(idx).node);
+            assert_eq!(
+                query.project_cached_match(&mat, idx, 0).is_err(),
+                count != 0
+            );
+            let full = query.project_match(&mat, idx).unwrap();
+            assert_eq!(full.excluded.len(), count);
+            let bytes = full.excluded.capacity() * std::mem::size_of::<Range>();
+            assert_eq!(crate::subtree_query::Event::heap_bytes(&full), bytes);
+            let cached = query
+                .project_cached_match(&mat, idx, bytes)
+                .unwrap()
+                .unwrap();
+            assert_eq!(cached.excluded, full.excluded);
+        }
     }
 
     #[test]
