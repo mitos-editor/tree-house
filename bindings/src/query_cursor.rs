@@ -28,6 +28,11 @@ pub struct QueryCursor<'a, 'tree, I: Input> {
 }
 
 impl<'tree, I: Input> QueryCursor<'_, 'tree, I> {
+    /// Whether this execution exhausted the configured in-progress match limit.
+    pub fn did_exceed_match_limit(&self) -> bool {
+        unsafe { ts_query_cursor_did_exceed_match_limit(self.ptr.as_ptr()) }
+    }
+
     pub fn next_match(&mut self) -> Option<QueryMatch<'_, 'tree>> {
         let mut query_match = TSQueryMatch {
             id: 0,
@@ -144,7 +149,15 @@ impl InactiveQueryCursor {
         };
         this.set_byte_range(range);
         this.set_match_limit(limit);
+        this.set_max_start_depth(u32::MAX);
         this
+    }
+
+    /// Limit the depth at which new matches may start. Zero matches only this root.
+    pub fn set_max_start_depth(&mut self, depth: u32) {
+        unsafe {
+            ts_query_cursor_set_max_start_depth(self.ptr.as_ptr(), depth);
+        }
     }
 
     /// Return the maximum number of in-progress matches for this cursor.
@@ -288,6 +301,7 @@ struct TSQueryMatch {
 }
 
 extern "C" {
+    fn ts_query_cursor_set_max_start_depth(cursor: *mut QueryCursorData, depth: u32);
     /// Advance to the next capture of the currently running query.
     /// If there is a capture, write its match to `*match` and its index within
     /// the matche's capture list to `*capture_index`. Otherwise, return `false`.

@@ -15,6 +15,25 @@ impl Syntax {
         edits: &[tree_sitter::InputEdit],
         loader: &impl LanguageLoader,
     ) -> Result<(), Error> {
+        let result = self.update_inner(source, timeout, edits, loader);
+        if result.is_err() {
+            // A partial update must not retain old caches alongside the new
+            // update's budget, or leave results reusable after an interrupted parse.
+            for (_, layer) in &mut self.layers {
+                layer.injection_cache = Default::default();
+                layer.local_cache = Default::default();
+            }
+        }
+        result
+    }
+
+    fn update_inner(
+        &mut self,
+        source: RopeSlice,
+        timeout: Duration,
+        edits: &[tree_sitter::InputEdit],
+        loader: &impl LanguageLoader,
+    ) -> Result<(), Error> {
         // size limit of 512MiB, TS just cannot handle files this big (too
         // slow). Furthermore, TS uses 32 (signed) bit indices so this limit
         // must never be raised above 2GiB
@@ -22,6 +41,7 @@ impl Syntax {
             return Err(Error::ExceededMaximumSize);
         }
 
+        self.query_generation = self.query_generation.wrapping_add(1);
         let mut queue = Vec::with_capacity(32);
         let root_flags = &mut self.layer_mut(self.root).flags;
         // The root layer is always considered.
@@ -31,11 +51,14 @@ impl Syntax {
         queue.push(self.root);
 
         let mut parser = Parser::new();
+        let mut cache_budget = crate::subtree_query::Budget::default();
 
         while let Some(layer) = queue.pop() {
             let layer_data = self.layer_mut(layer);
             if layer_data.ranges.is_empty() {
                 // Skip re-parsing and querying layers without any ranges.
+                layer_data.injection_cache = Default::default();
+                layer_data.local_cache = Default::default();
                 continue;
             }
             if let Some(tree) = &mut layer_data.parse_tree {
@@ -55,8 +78,10 @@ impl Syntax {
                 // always parse if this layer has never been parsed before
                 layer_data.parse(&mut parser, source, timeout, loader)?;
             }
-            self.run_injection_query(layer, edits, source, loader, |layer| queue.push(layer));
-            self.run_local_query(layer, source, loader);
+            self.run_injection_query(layer, edits, source, loader, &mut cache_budget, |layer| {
+                queue.push(layer)
+            });
+            self.run_local_query(layer, source, loader, edits, &mut cache_budget);
         }
 
         if self.layer(self.root).parse_tree.is_none() {

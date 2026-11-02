@@ -1,6 +1,7 @@
 use std::fmt::{self, Display};
 use std::ops::Range;
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 use std::{slice, str};
 
 use crate::query::predicate::TextPredicate;
@@ -63,6 +64,8 @@ pub(super) struct PatternData {
 
 #[derive(Debug)]
 pub struct Query {
+    revision: u64,
+    partitionable: OnceLock<bool>,
     pub(crate) raw: NonNull<QueryData>,
     num_captures: u32,
     num_strings: u32,
@@ -73,7 +76,25 @@ pub struct Query {
 unsafe impl Send for Query {}
 unsafe impl Sync for Query {}
 
+fn next_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Query {
+    /// Identity of the compiled query and its enabled captures/patterns.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    /// Check whether patterns can run without parent or sibling context.
+    /// Callers must also handle captures on the node whose children they query.
+    pub fn can_partition_subtrees(&self) -> bool {
+        // Only subtree-cache users need this check. Reuse it until a query
+        // change clears the result.
+        *self
+            .partitionable
+            .get_or_init(|| unsafe { tree_house_query_can_partition(self.raw) })
+    }
     /// Create a new query from a string containing one or more S-expression
     /// patterns.
     ///
@@ -156,6 +177,8 @@ impl Query {
         let num_patterns = unsafe { ts_query_pattern_count(raw) };
 
         let mut query = Query {
+            revision: next_revision(),
+            partitionable: OnceLock::new(),
             raw,
             num_captures,
             num_strings,
@@ -302,6 +325,8 @@ impl Query {
     /// any resource usage associated with recording the capture. Currently, there
     /// is no way to undo this.
     pub fn disable_capture(&mut self, name: &str) {
+        self.revision = next_revision();
+        let _ = self.partitionable.take();
         let bytes = name.as_bytes();
         unsafe {
             ts_query_disable_capture(self.raw, bytes.as_ptr(), bytes.len() as u32);
@@ -313,6 +338,8 @@ impl Query {
     /// This prevents the pattern from matching and removes most of the overhead
     /// associated with the pattern. Currently, there is no way to undo this.
     pub fn disable_pattern(&mut self, pattern: Pattern) {
+        self.revision = next_revision();
+        let _ = self.partitionable.take();
         unsafe {
             ts_query_disable_pattern(self.raw, pattern.0);
         }
@@ -484,6 +511,7 @@ enum RawQueryError {
 }
 
 extern "C" {
+    fn tree_house_query_can_partition(query: NonNull<QueryData>) -> bool;
     /// Create a new query from a string containing one or more S-expression
     /// patterns. The query is associated with a particular language, and can
     /// only be run on syntax nodes parsed with that language. If all of the

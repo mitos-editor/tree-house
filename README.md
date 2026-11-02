@@ -10,3 +10,25 @@ Documentation is a work-in-progress and these crates may see breaking changes as
 * `highlighter/` contains the `tree-house` crate which exposes a robust highlighter and query iterator for working across [injections].
 * `skidder/` contains the `skidder` crate which exposes utilities for building a package repository for tree-sitter grammars.
 * `cli/` contains the `skidder-cli` crate which wraps `skidder` in a command line interface.
+
+### Incremental syntax queries
+
+After an edit, injection and local-scope queries can reuse captures from
+unchanged direct children of a syntax layer. Edited children are queried again;
+captures in moved children get updated byte ranges. Scope construction and
+injection reconciliation still run in full.
+
+Queries that depend on parent or sibling context use the original full query.
+So do root captures, multiple injection-content captures and cases that exceed
+4,096 children or 65,536 events per layer/query. All query caches in one syntax
+document share a 2 MiB budget for owned buffers, including nested exclusion
+arrays. Native trees, allocator overhead and temporary query results are outside
+that budget. Exceeding a limit releases that query's cache and runs the full query.
+
+Query changes, changed included ranges and skipped updates invalidate cached
+results. Cloning syntax preserves its semantic state and starts with empty caches.
+Interrupted updates release all query caches.
+
+The cache checks compiled Tree-sitter steps through `bindings/src/extended.c`.
+The build requires an explicit review of that helper when changing the vendored
+Tree-sitter revision.

@@ -8,7 +8,7 @@ use kstring::KString;
 use ropey::RopeSlice;
 use tree_sitter::{Capture, InactiveQueryCursor};
 
-use crate::{LanguageConfig, LanguageLoader, Layer, Range, Syntax, TREE_SITTER_MATCH_LIMIT};
+use crate::{LanguageConfig, LanguageLoader, Layer, Range, Syntax};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Scope(u32);
@@ -168,36 +168,93 @@ pub struct ScopeData {
     parent: Option<Scope>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LocalEvent {
+    capture: Capture,
+    pattern: tree_sitter::Pattern,
+    range: Range,
+}
+impl crate::subtree_query::Event for LocalEvent {
+    fn shift(&mut self, offset: i64, _: u32) {
+        crate::subtree_query::shift_range(&mut self.range, offset);
+    }
+    fn cacheable(&self) -> bool {
+        !self.range.is_empty()
+    }
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+}
+
 impl Syntax {
     pub(crate) fn run_local_query(
         &mut self,
         layer: Layer,
         source: RopeSlice<'_>,
         loader: &impl LanguageLoader,
+        edits: &[tree_sitter::InputEdit],
+        budget: &mut crate::subtree_query::Budget,
     ) {
+        let generation = self.query_generation;
         let layer_data = &mut self.layer_mut(layer);
         let Some(LanguageConfig {
             ref injection_query,
             ..
         }) = loader.get_config(layer_data.language)
         else {
+            layer_data.local_cache = Default::default();
             return;
         };
         let definition_captures = injection_query.local_definition_captures.load();
         if definition_captures.is_empty() {
+            layer_data.local_cache = Default::default();
             return;
         }
 
-        let root = layer_data.parse_tree.as_ref().unwrap().root_node();
-        let mut cursor = InactiveQueryCursor::new(0..u32::MAX, TREE_SITTER_MATCH_LIMIT)
-            .execute_query(&injection_query.local_query, &root, source);
+        let events = layer_data.local_cache.collect(
+            &injection_query.local_query,
+            layer_data.parse_tree.as_ref().unwrap(),
+            source,
+            edits,
+            &layer_data.ranges,
+            generation,
+            budget,
+            |query_match, node_idx, _| {
+                let node = query_match.matched_node(node_idx);
+                Ok(Some(LocalEvent {
+                    capture: node.capture,
+                    pattern: query_match.pattern(),
+                    range: node.node.byte_range(),
+                }))
+            },
+        );
+        let mut cursor = events.is_none().then(|| {
+            InactiveQueryCursor::new(0..u32::MAX, crate::TREE_SITTER_MATCH_LIMIT).execute_query(
+                &injection_query.local_query,
+                &layer_data.parse_tree.as_ref().unwrap().root_node(),
+                source,
+            )
+        });
+        let mut cached = events.map(Vec::into_iter);
+        let events = std::iter::from_fn(move || {
+            if let Some(cached) = &mut cached {
+                cached.next()
+            } else {
+                let (mat, idx) = cursor.as_mut()?.next_matched_node()?;
+                let node = mat.matched_node(idx);
+                Some(LocalEvent {
+                    capture: node.capture,
+                    pattern: mat.pattern(),
+                    range: node.node.byte_range(),
+                })
+            }
+        });
         let mut locals = Locals::default();
         let mut scope = Scope::ROOT;
 
-        while let Some((query_match, node_idx)) = cursor.next_matched_node() {
-            let matched_node = query_match.matched_node(node_idx);
-            let range = matched_node.node.byte_range();
-            let capture = matched_node.capture;
+        for event in events {
+            let range = event.range;
+            let capture = event.capture;
 
             while range.start >= locals[scope].range.end {
                 scope = locals[scope].parent.expect("root node covers entire range");
@@ -206,10 +263,8 @@ impl Syntax {
             if Some(capture) == injection_query.local_scope_capture {
                 scope = locals.push(ScopeData {
                     definitions: HashMap::new(),
-                    range: matched_node.node.byte_range(),
-                    inherit: !injection_query
-                        .not_scope_inherits
-                        .contains(&query_match.pattern()),
+                    range: range.clone(),
+                    inherit: !injection_query.not_scope_inherits.contains(&event.pattern),
                     children: Vec::new(),
                     parent: Some(scope),
                 });
